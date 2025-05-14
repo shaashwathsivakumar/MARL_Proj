@@ -1,6 +1,6 @@
 from pettingzoo.mpe import simple_tag_v3
 
-env = simple_tag_v3.parallel_env(render_mode="human")
+env = simple_tag_v3.parallel_env(render_mode="human", max_cycles=1000)
 observations, infos = env.reset()
 i = 0
 
