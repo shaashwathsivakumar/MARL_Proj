@@ -54,7 +54,10 @@ class ReplayBuffer:
 
 def train(environment, max_episode_count, max_episode_length):
     env = simple_tag_v3.parallel_env(render_mode="human", max_cycles=1000)
-    env.num_adversaries
+    observations, infos = env.reset()
+    # create a tuple of agent networks
+    actors = [Actor() for i in range(env.num_agents-1)]
+    critics = [Critic() for i in range(env.num_agents-1)]
     for episode in range(max_episode_count):
         # initialize random process for action exploration
         observations, info = env.reset()

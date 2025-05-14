@@ -1,4 +1,5 @@
 # noqa: D212, D415
+
 """
 # Simple Tag
 
