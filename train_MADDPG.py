@@ -1,4 +1,5 @@
 import random
+import numpy as np
 from collections import deque
 import torch
 import torch.nn as nn
@@ -90,7 +91,11 @@ class ReplayBuffer:
     def sample(self, batch_size):
         return random.sample(self.buffer, batch_size)
 
-
+    def geom_sample(self, batch_size, p):
+        x = len(self.buffer) + 1
+        while x > len(self.buffer):
+            x = np.random.geometric(p, size=batch_size)
+        return self.buffer[len(self.buffer) - x]
 def one_hot(index, size):
     vec = torch.zeros(size)
     vec[index] = 1.0
@@ -115,7 +120,7 @@ def plot(reward):
     plt.show()
 
 
-def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, gamma, lr, noise_param, device="cpu"):
+def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, gamma, lr, noise_param, p, device="cpu"):
     env = simple_tag_v3.parallel_env(render_mode="human", max_cycles=max_episode_length)
     observations, infos = env.reset()
     adversaries = env.agents[0:-1]
@@ -143,7 +148,7 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
             observations = next_obs
             if len(D.buffer) >= minibatch_size:
                 for adv in adversaries:
-                    samples = D.sample(minibatch_size)
+                    samples = D.geom_sample(minibatch_size, p)
                     s_states = torch.stack([torch.tensor(s[0], dtype=torch.float32) for s in samples]).to(device)
                     s_next_states = torch.stack([torch.tensor(s[3], dtype=torch.float32) for s in samples]).to(device)
                     s_rewards = torch.tensor([s[2][adv] for s in samples], dtype=torch.float32).to(device)
@@ -188,4 +193,4 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
 
 
 if __name__ == "__main__":
-    train(40, 50, 50, 10, 0.95, 0.001, 0.3, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    train(40, 50, 50, 10, 0.95, 0.001, 0.3, 0.2, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
