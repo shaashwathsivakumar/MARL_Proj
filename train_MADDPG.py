@@ -1,3 +1,4 @@
+import numpy as np
 import random
 from collections import deque
 import torch
@@ -114,17 +115,36 @@ def plot(reward):
     plt.grid(True)
     plt.show()
 
+def running_reward(arr: np.ndarray, previous=100):
+    """calculate the running reward, i.e. average of last `previous` elements from rewards"""
+    running_reward = np.zeros_like(arr)
+    for i in range(previous - 1):
+        running_reward[i] = np.mean(arr[:i + 1])
+    for i in range(previous - 1, len(arr)):
+        running_reward[i] = np.mean(arr[i - previous + 1:i + 1])
+    return running_reward
+    
 
 def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, gamma, lr, noise_param, device="cpu"):
+    # create folder to save result
+    env_dir = os.path.join('./results', 'simple_tag_v3')
+    if not os.path.exists(env_dir):
+        os.makedirs(env_dir)
+    total_files = len([file for file in os.listdir(env_dir)])
+    result_dir = os.path.join(env_dir, f'{total_files + 1}')
+    os.makedirs(result_dir)
+
+
     env = simple_tag_v3.parallel_env(render_mode=None, max_cycles=max_episode_length)
     observations, infos = env.reset()
+    reward_by_agent = {agent_id: 0 for agent_id in env.agents}  # agent reward of the current episode
     all_agents = env.agents
     agents = {agent: MADDPGAgent(len(observations[agent]), env.action_space(agent).n, len(env.state()), sum(env.action_space(a).n for a in all_agents), lr, device) for agent in all_agents}
     D = ReplayBuffer(max_capacity)
-    episode_rewards = []
-    for i in range(max_episode_count):
+    episode_rewards = {agent_id: np.zeros(max_episode_count) for agent_id in env.agents}
+    for episode in range(max_episode_count):
         observations, infos = env.reset()
-        total_reward = 0
+        # total_reward = 0 I deleted this variable because instead i am tracking the rewards using the reward_by_agent dictionary
         while env.agents:
             state = env.state()
             actions = {}
@@ -135,13 +155,20 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
                 action = torch.argmax(logits + noise).item()
                 actions[adv] = action
                 logits_store[adv] = logits
+            # execute actions and observe next state and reward 
             next_obs, rewards, terminations, truncations, infos = env.step(actions)
-            total_reward += sum(rewards.values())
+            # total_reward += sum(rewards.values())
             next_state = env.state()
             D.push(state, actions, rewards, next_state, observations)
+
+            # store the rewards of each agent to our dictionary
+            for agent_id, r in rewards.items():
+                reward_by_agent[agent_id] += r
+
             observations = next_obs
             if len(D.buffer) >= minibatch_size:
                 for adv in all_agents:
+                    # Sample a random minibatch of S samples
                     samples = D.sample(minibatch_size)
                     s_states = torch.stack([torch.tensor(s[0], dtype=torch.float32) for s in samples]).to(device)
                     s_next_states = torch.stack([torch.tensor(s[3], dtype=torch.float32) for s in samples]).to(device)
@@ -155,6 +182,7 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
                         next_actions_onehot = F.one_hot(next_action_indices, num_classes=env.action_space(ag).n).float()
                         next_acts.append(next_actions_onehot)
                     next_joint_actions = torch.cat(next_acts, dim=-1)
+                    # update critic
                     with torch.no_grad():
                         target_q = s_rewards + gamma * agents[adv].target_critic(s_next_states, next_joint_actions).squeeze(1)
                     joint_acts = []
@@ -180,10 +208,37 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
                     agents[adv].update_actor(actor_loss + 1e-3 * regularization)
                 for adv in all_agents:
                     agents[adv].update_targets(tau = 0.01)
-        episode_rewards.append(total_reward)        
-    env.close()
-    #plot(episode_rewards)
+        
+        # episode is finished
+        for agent_id, r in reward_by_agent.items():  # record reward
+            episode_rewards[agent_id][episode] = r
+
+        if (episode + 1) % 100 == 0:  # print info every 100 episodes
+            message = f'episode {episode + 1}, '
+            sum_reward = 0
+            for agent_id, r in reward_by_agent.items():  # record reward
+                message += f'{agent_id}: {r:>4f}; '
+                sum_reward += r
+            message += f'sum reward: {sum_reward}'
+            print(message)
+    
+    env.close() # i think we should not render environment while training 
     #save(episode_rewards)
+
+    # training finishes, plot reward
+    fig, ax = plt.subplots()
+    x = range(1, max_episode_count + 1)
+    for agent_id, reward in episode_rewards.items():
+        ax.plot(x, reward, label=agent_id)
+        ax.plot(x, running_reward(reward))
+    ax.legend()
+    ax.set_xlabel('episode')
+    ax.set_ylabel('reward')
+    title = f'training result of maddpg solve {'simple_tag_v3'}'
+    ax.set_title(title)
+    plt.savefig(os.path.join(result_dir, title))
+
+    
 
 
 if __name__ == "__main__":
