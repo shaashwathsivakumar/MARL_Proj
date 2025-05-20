@@ -1,5 +1,4 @@
 import random
-import numpy as np
 from collections import deque
 import torch
 import torch.nn as nn
@@ -91,11 +90,7 @@ class ReplayBuffer:
     def sample(self, batch_size):
         return random.sample(self.buffer, batch_size)
 
-    def geom_sample(self, batch_size, p):
-        x = len(self.buffer) + 1
-        while x > len(self.buffer):
-            x = np.random.geometric(p, size=batch_size)
-        return self.buffer[len(self.buffer) - x]
+
 def one_hot(index, size):
     vec = torch.zeros(size)
     vec[index] = 1.0
@@ -120,11 +115,11 @@ def plot(reward):
     plt.show()
 
 
-def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, gamma, lr, noise_param, p, device="cpu"):
-    env = simple_tag_v3.parallel_env(render_mode="human", max_cycles=max_episode_length)
+def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, gamma, lr, noise_param, device="cpu"):
+    env = simple_tag_v3.parallel_env(render_mode=None, max_cycles=max_episode_length)
     observations, infos = env.reset()
-    adversaries = env.agents[0:-1]
-    agents = {adv: MADDPGAgent(len(observations[adv]), env.action_space(adv).n, len(env.state()), sum(env.action_space(a).n for a in adversaries), lr, device) for adv in adversaries}
+    all_agents = env.agents
+    agents = {agent: MADDPGAgent(len(observations[agent]), env.action_space(agent).n, len(env.state()), sum(env.action_space(a).n for a in all_agents), lr, device) for agent in all_agents}
     D = ReplayBuffer(max_capacity)
     episode_rewards = []
     for i in range(max_episode_count):
@@ -134,37 +129,36 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
             state = env.state()
             actions = {}
             logits_store = {}
-            for adv in adversaries:
-                action, logits = agents[adv].get_action(observations[adv], model_out=True, device=device)
+            for adv in all_agents:
+                logits = agents[adv].get_action(observations[adv], model_out=True, device=device)[1]
                 noise = torch.randn_like(logits) * noise_param
-                action = torch.multinomial(torch.softmax(logits + noise, dim = -1), 1).item()
+                action = torch.argmax(logits + noise).item()
                 actions[adv] = action
                 logits_store[adv] = logits
-            actions["agent_0"] = env.action_space("agent_0").sample()
             next_obs, rewards, terminations, truncations, infos = env.step(actions)
             total_reward += sum(rewards.values())
             next_state = env.state()
             D.push(state, actions, rewards, next_state, observations)
             observations = next_obs
             if len(D.buffer) >= minibatch_size:
-                for adv in adversaries:
-                    samples = D.geom_sample(minibatch_size, p)
+                for adv in all_agents:
+                    samples = D.sample(minibatch_size)
                     s_states = torch.stack([torch.tensor(s[0], dtype=torch.float32) for s in samples]).to(device)
                     s_next_states = torch.stack([torch.tensor(s[3], dtype=torch.float32) for s in samples]).to(device)
                     s_rewards = torch.tensor([s[2][adv] for s in samples], dtype=torch.float32).to(device)
                     next_acts = []
-                    for ag in adversaries:
+                    for ag in all_agents:
                         obs_batch = torch.stack([torch.tensor(s[4][ag], dtype=torch.float32) for s in samples]).to(
                             device)
                         logits = agents[ag].target_actor(obs_batch)
-                        next_action_indices = torch.multinomial(logits, 1).squeeze(1)
+                        next_action_indices = torch.argmax(logits, dim = -1)
                         next_actions_onehot = F.one_hot(next_action_indices, num_classes=env.action_space(ag).n).float()
                         next_acts.append(next_actions_onehot)
                     next_joint_actions = torch.cat(next_acts, dim=-1)
                     with torch.no_grad():
                         target_q = s_rewards + gamma * agents[adv].target_critic(s_next_states, next_joint_actions).squeeze(1)
                     joint_acts = []
-                    for ag in adversaries:
+                    for ag in all_agents:
                         actions = torch.tensor([s[1][ag] for s in samples], dtype=torch.int64)
                         joint_acts.append(F.one_hot(actions, num_classes=env.action_space(ag).n).float().to(device))
                     current_q = agents[adv].critic(s_states, torch.cat(joint_acts, dim=-1)).squeeze(1)
@@ -172,7 +166,7 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
                     agents[adv].update_critic(critic_loss)
                     # actor update
                     actor_acts = []
-                    for ag in adversaries:
+                    for ag in all_agents:
                         obs_batch = torch.stack([torch.tensor(s[4][ag], dtype=torch.float32) for s in samples]).to(device)
                         logits = agents[ag].actor(obs_batch)
                         if ag == adv:
@@ -184,7 +178,7 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
                     actor_loss = -agents[adv].critic(s_states, actor_input).mean()
                     regularization = (adv_logits ** 2).mean()
                     agents[adv].update_actor(actor_loss + 1e-3 * regularization)
-                for adv in adversaries:
+                for adv in all_agents:
                     agents[adv].update_targets(tau = 0.01)
         episode_rewards.append(total_reward)        
     env.close()
@@ -193,4 +187,4 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
 
 
 if __name__ == "__main__":
-    train(40, 50, 50, 10, 0.95, 0.001, 0.3, 0.2, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    train(40, 50, 50, 10, 0.95, 0.001, 0.3, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
