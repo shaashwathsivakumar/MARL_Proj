@@ -47,6 +47,7 @@ class MADDPGAgent:
         self.target_actor = deepcopy(self.actor)
         self.target_critic = deepcopy(self.critic)
 
+    '''
     def get_action(self, obs, model_out=False, device="cpu"):
         obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         logits = self.actor(obs_tensor)
@@ -54,6 +55,21 @@ class MADDPGAgent:
         action = dist.sample().item()
         if model_out:
             return action, logits.squeeze(0)
+        return action
+    
+    '''
+    def get_action(self, obs, model_out=False, device="cpu", noise_param=0.0, deterministic=False):
+        obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        logits = self.actor(obs_tensor)
+
+        if deterministic:
+            action = torch.argmax(logits).item()
+        else:
+            noise = torch.randn_like(logits) * noise_param
+            action = torch.argmax(logits + noise).item()
+
+        if model_out:
+            return action, logits
         return action
 
     def critic_value(self, state_list, action_list):
@@ -118,10 +134,13 @@ def plot(reward):
 def running_reward(arr: np.ndarray, previous=100):
     """calculate the running reward, i.e. average of last `previous` elements from rewards"""
     running_reward = np.zeros_like(arr)
-    for i in range(previous - 1):
-        running_reward[i] = np.mean(arr[:i + 1])
-    for i in range(previous - 1, len(arr)):
-        running_reward[i] = np.mean(arr[i - previous + 1:i + 1])
+    for i in range(len(arr)):
+        start = max(0, i - previous + 1)
+        running_reward[i] = np.mean(arr[start:i + 1])
+    #for i in range(previous - 1):
+    #    running_reward[i] = np.mean(arr[:i + 1])
+    #for i in range(previous - 1, len(arr)):
+    #    running_reward[i] = np.mean(arr[i - previous + 1:i + 1])
     return running_reward
     
 
@@ -135,11 +154,15 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
     os.makedirs(result_dir)
 
 
-    env = simple_tag_v3.parallel_env(render_mode=None, max_cycles=max_episode_length)
+    env = simple_tag_v3.parallel_env(render_mode='rgb_array', max_cycles=max_episode_length)
     observations, infos = env.reset()
+
     reward_by_agent = {agent_id: 0 for agent_id in env.agents}  # agent reward of the current episode
     all_agents = env.agents
     agents = {agent: MADDPGAgent(len(observations[agent]), env.action_space(agent).n, len(env.state()), sum(env.action_space(a).n for a in all_agents), lr, device) for agent in all_agents}
+    for name, agent in agents.items():
+        for param in agent.actor.parameters():
+            param.data += torch.randn_like(param) * 0.01
     D = ReplayBuffer(max_capacity)
     episode_rewards = {agent_id: np.zeros(max_episode_count) for agent_id in env.agents}
     for episode in range(max_episode_count):
@@ -150,13 +173,21 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
             actions = {}
             logits_store = {}
             for adv in all_agents:
-                logits = agents[adv].get_action(observations[adv], model_out=True, device=device)[1]
-                noise = torch.randn_like(logits) * noise_param
-                action = torch.argmax(logits + noise).item()
+                action, logits = agents[adv].get_action(observations[adv], model_out=True, device=device,
+                                                        noise_param=noise_param)
                 actions[adv] = action
                 logits_store[adv] = logits
+            #    logits = agents[adv].get_action(observations[adv], model_out=True, device=device)[1]
+            #    noise = torch.randn_like(logits) * noise_param
+            #    action = torch.argmax(logits + noise).item()
+            #    actions[adv] = action
+            #    logits_store[adv] = logits
             # execute actions and observe next state and reward 
             next_obs, rewards, terminations, truncations, infos = env.step(actions)
+            print("Step rewards:")
+            for agent_id, reward in rewards.items():
+                print(f"  {agent_id}: {reward:.4f}")
+
             # total_reward += sum(rewards.values())
             next_state = env.state()
             D.push(state, actions, rewards, next_state, observations)
@@ -190,8 +221,12 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
                         actions = torch.tensor([s[1][ag] for s in samples], dtype=torch.int64)
                         joint_acts.append(F.one_hot(actions, num_classes=env.action_space(ag).n).float().to(device))
                     current_q = agents[adv].critic(s_states, torch.cat(joint_acts, dim=-1)).squeeze(1)
+                    #print(
+                    #    f"[{adv}] Q-values: current_q mean={current_q.mean().item():.4f}, target_q mean={target_q.mean().item():.4f}")
                     critic_loss = nn.MSELoss()(current_q, target_q)
                     agents[adv].update_critic(critic_loss)
+                    #print(f"[Episode {episode}] Critic loss for {adv}: {critic_loss.item():.4f}")
+
                     # actor update
                     actor_acts = []
                     for ag in all_agents:
@@ -207,7 +242,7 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
                     regularization = (adv_logits ** 2).mean()
                     agents[adv].update_actor(actor_loss + 1e-3 * regularization)
                 for adv in all_agents:
-                    agents[adv].update_targets(tau = 0.01)
+                    agents[adv].update_targets(tau = 0.001)
         
         # episode is finished
         for agent_id, r in reward_by_agent.items():  # record reward
@@ -234,12 +269,18 @@ def train(max_episode_count, max_episode_length, max_capacity, minibatch_size, g
     ax.legend()
     ax.set_xlabel('episode')
     ax.set_ylabel('reward')
-    title = f'training result of maddpg solve {'simple_tag_v3'}'
+    title = f"training result of maddpg solve {'simple_tag_v3'}"
     ax.set_title(title)
     plt.savefig(os.path.join(result_dir, title))
 
+    #torch.save(
+    #    {name: agent.actor.state_dict() for name, agent in agents.items()},
+    #    os.path.join(result_dir, 'model.pt')
+    #)
+    #with open(os.path.join(result_dir, 'rewards.pkl'), 'wb') as f:
+    #    pickle.dump(episode_rewards, f)
     
 
 
 if __name__ == "__main__":
-    train(40, 50, 50, 10, 0.95, 0.001, 0.3, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    train(500, 50, 1000, 64, 0.9, 5e-5, 0.5, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
