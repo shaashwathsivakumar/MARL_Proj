@@ -1,0 +1,19 @@
+{
+  "env_name": "simple_crypto_v3",
+  "episode_length": 25,
+  "num_episodes": 30000,
+  "warmup_steps": 50000,
+  "learn_interval": 100,
+  "batch_size": 1024,
+  "buffer_capacity": 1000000,
+  "gamma": 0.95,
+  "tau": 0.02,
+  "actor_lr": 0.01,
+  "critic_lr": 0.01,
+  "use_geometric_sampling": false,
+  "geo_alpha": 1e-05,
+  "use_prev_action": false,
+  "device": "cpu",
+  "log_interval": 1000,
+  "checkpoint_interval": 10000
+}

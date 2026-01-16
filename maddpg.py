@@ -63,9 +63,12 @@ class MADDPG:
     - Centralized training with decentralized execution
     - Each agent's critic sees all observations and actions
     - Gumbel-Softmax for differentiable discrete actions
+    - Optional: geometric sampling for recent experience bias
+    - Optional: previous action conditioning for critic
     """
     def __init__(self, agent_ids, obs_dims, action_dims, buffer_capacity,
-                 actor_lr=0.01, critic_lr=0.01, device='cpu'):
+                 actor_lr=0.01, critic_lr=0.01, device='cpu',
+                 geometric_sampling=False, geo_alpha=1e-5, use_prev_action=False):
         """
         Args:
             agent_ids: List of agent identifiers
@@ -75,16 +78,24 @@ class MADDPG:
             actor_lr: Learning rate for actor networks
             critic_lr: Learning rate for critic networks
             device: Torch device
+            geometric_sampling: Whether to use geometric sampling in replay buffer
+            geo_alpha: Decay rate for geometric sampling
+            use_prev_action: Whether to condition critic on previous joint action
         """
         self.agent_ids = agent_ids
         self.obs_dims = obs_dims
         self.action_dims = action_dims
         self.device = device
+        self.use_prev_action = use_prev_action
 
-        # Critic input: all observations + all actions
+        # Critic input: all observations + all actions (+ previous actions if enabled)
         total_obs_dim = sum(obs_dims.values())
         total_action_dim = sum(action_dims.values())
+        self.total_action_dim = total_action_dim
+
         critic_input_dim = total_obs_dim + total_action_dim
+        if use_prev_action:
+            critic_input_dim += total_action_dim  # Add space for previous joint action
 
         # Create agents
         self.agents = {
@@ -101,7 +112,8 @@ class MADDPG:
 
         # Shared replay buffer with per-agent storage
         self.buffer = MultiAgentReplayBuffer(
-            agent_ids, buffer_capacity, obs_dims, action_dims, device
+            agent_ids, buffer_capacity, obs_dims, action_dims, device,
+            geometric_sampling, geo_alpha, use_prev_action
         )
 
     def select_actions(self, observations, explore=True):
@@ -119,9 +131,11 @@ class MADDPG:
             for agent_id in self.agent_ids
         }
 
-    def store_transition(self, observations, actions, rewards, next_observations, dones):
+    def store_transition(self, observations, actions, rewards, next_observations, dones,
+                         prev_joint_action=None):
         """Store a transition for all agents."""
-        self.buffer.add(observations, actions, rewards, next_observations, dones)
+        self.buffer.add(observations, actions, rewards, next_observations, dones,
+                        prev_joint_action)
 
     def update(self, batch_size, gamma):
         """
@@ -150,14 +164,28 @@ class MADDPG:
         # Current Q-value: Q(s, a) where s and a are all agents' obs/actions
         current_obs = torch.cat([batch['obs'][aid] for aid in self.agent_ids], dim=1)
         current_actions = torch.cat([batch['actions'][aid] for aid in self.agent_ids], dim=1)
-        current_q = agent.critic(torch.cat([current_obs, current_actions], dim=1)).squeeze(1)
+
+        # Build critic input (optionally include previous joint action)
+        if self.use_prev_action:
+            prev_joint_action = batch['prev_joint_action']
+            critic_input = torch.cat([current_obs, prev_joint_action, current_actions], dim=1)
+        else:
+            critic_input = torch.cat([current_obs, current_actions], dim=1)
+
+        current_q = agent.critic(critic_input).squeeze(1)
 
         # Target Q-value: r + gamma * Q'(s', a') * (1 - done)
         next_obs = torch.cat([batch['next_obs'][aid] for aid in self.agent_ids], dim=1)
         next_actions = torch.cat([target_actions[aid] for aid in self.agent_ids], dim=1)
 
         with torch.no_grad():
-            target_q = agent.target_critic(torch.cat([next_obs, next_actions], dim=1)).squeeze(1)
+            # For target: prev_action at next state = current_actions
+            if self.use_prev_action:
+                target_critic_input = torch.cat([next_obs, current_actions, next_actions], dim=1)
+            else:
+                target_critic_input = torch.cat([next_obs, next_actions], dim=1)
+
+            target_q = agent.target_critic(target_critic_input).squeeze(1)
             td_target = batch['rewards'][agent_id] + gamma * target_q * (1 - batch['dones'][agent_id])
 
         critic_loss = F.mse_loss(current_q, td_target)
@@ -184,7 +212,13 @@ class MADDPG:
 
         # Actor loss: maximize Q-value
         all_actor_actions = torch.cat(actor_actions, dim=1)
-        actor_loss = -agent.critic(torch.cat([current_obs, all_actor_actions], dim=1)).mean()
+
+        if self.use_prev_action:
+            actor_critic_input = torch.cat([current_obs, prev_joint_action, all_actor_actions], dim=1)
+        else:
+            actor_critic_input = torch.cat([current_obs, all_actor_actions], dim=1)
+
+        actor_loss = -agent.critic(actor_critic_input).mean()
 
         # Regularization: penalize large logits
         reg_loss = (current_logits ** 2).mean()

@@ -10,9 +10,12 @@ class ReplayBuffer:
     Fixed-size replay buffer for a single agent.
     Stores transitions and provides batch sampling.
     """
-    def __init__(self, capacity, obs_dim, action_dim, device='cpu'):
+    def __init__(self, capacity, obs_dim, action_dim, device='cpu',
+                 geometric_sampling=False, geo_alpha=1e-5):
         self.capacity = capacity
         self.device = device
+        self.geometric_sampling = geometric_sampling
+        self.geo_alpha = geo_alpha
 
         # Pre-allocate memory for efficiency
         self.observations = np.zeros((capacity, obs_dim), dtype=np.float32)
@@ -36,8 +39,19 @@ class ReplayBuffer:
         self._size = min(self._size + 1, self.capacity)
 
     def sample_indices(self, batch_size):
-        """Generate random indices for sampling."""
-        return np.random.choice(self._size, size=batch_size, replace=False)
+        """Generate indices for sampling, optionally with geometric weighting."""
+        if not self.geometric_sampling:
+            return np.random.choice(self._size, size=batch_size, replace=False)
+
+        # Compute age of each sample (0 = most recent, _size-1 = oldest)
+        indices = np.arange(self._size)
+        ages = (self._ptr - 1 - indices) % self._size
+
+        # Exponential weighting: w[i] = exp(-alpha * age[i])
+        weights = np.exp(-self.geo_alpha * ages)
+        weights /= weights.sum()
+
+        return np.random.choice(self._size, size=batch_size, replace=False, p=weights)
 
     def get_batch(self, indices):
         """
@@ -62,8 +76,10 @@ class MultiAgentReplayBuffer:
     """
     Collection of replay buffers, one per agent.
     Ensures synchronized sampling across all agents.
+    Optionally stores previous joint actions for critic conditioning.
     """
-    def __init__(self, agent_ids, capacity, obs_dims, action_dims, device='cpu'):
+    def __init__(self, agent_ids, capacity, obs_dims, action_dims, device='cpu',
+                 geometric_sampling=False, geo_alpha=1e-5, use_prev_action=False):
         """
         Args:
             agent_ids: List of agent identifiers
@@ -71,14 +87,32 @@ class MultiAgentReplayBuffer:
             obs_dims: Dict mapping agent_id -> observation dimension
             action_dims: Dict mapping agent_id -> action dimension
             device: Torch device for tensor conversion
+            geometric_sampling: Whether to use geometric sampling
+            geo_alpha: Decay rate for geometric sampling
+            use_prev_action: Whether to store previous joint actions
         """
         self.agent_ids = agent_ids
+        self.device = device
+        self.use_prev_action = use_prev_action
+        self.action_dims = action_dims
+
         self.buffers = {
-            agent_id: ReplayBuffer(capacity, obs_dims[agent_id], action_dims[agent_id], device)
+            agent_id: ReplayBuffer(
+                capacity, obs_dims[agent_id], action_dims[agent_id], device,
+                geometric_sampling, geo_alpha
+            )
             for agent_id in agent_ids
         }
 
-    def add(self, observations, actions, rewards, next_observations, dones):
+        # Storage for previous joint actions (concatenated across all agents)
+        if use_prev_action:
+            total_action_dim = sum(action_dims.values())
+            self.prev_joint_actions = np.zeros((capacity, total_action_dim), dtype=np.float32)
+            self._ptr = 0
+            self._capacity = capacity
+
+    def add(self, observations, actions, rewards, next_observations, dones,
+            prev_joint_action=None):
         """
         Add transitions for all agents.
 
@@ -88,6 +122,7 @@ class MultiAgentReplayBuffer:
             rewards: Dict of rewards per agent
             next_observations: Dict of next observations per agent
             dones: Dict of done flags per agent
+            prev_joint_action: Optional concatenated previous joint action
         """
         for agent_id in self.agent_ids:
             action = actions[agent_id]
@@ -106,13 +141,19 @@ class MultiAgentReplayBuffer:
                 dones[agent_id]
             )
 
+        # Store previous joint action if enabled
+        if self.use_prev_action and prev_joint_action is not None:
+            self.prev_joint_actions[self._ptr] = prev_joint_action
+            self._ptr = (self._ptr + 1) % self._capacity
+
     def sample(self, batch_size):
         """
         Sample synchronized batches from all agent buffers.
 
         Returns:
             Dict with keys: 'obs', 'actions', 'rewards', 'next_obs', 'dones'
-            Each value is a dict mapping agent_id -> tensor
+            Optionally includes 'prev_joint_action' if use_prev_action is True
+            Each value is a dict mapping agent_id -> tensor (or tensor for prev_joint_action)
         """
         # Use same indices for all agents to keep transitions aligned
         indices = self.buffers[self.agent_ids[0]].sample_indices(batch_size)
@@ -132,6 +173,12 @@ class MultiAgentReplayBuffer:
             batch['rewards'][agent_id] = rewards
             batch['next_obs'][agent_id] = next_obs
             batch['dones'][agent_id] = dones
+
+        # Include previous joint action if enabled
+        if self.use_prev_action:
+            batch['prev_joint_action'] = torch.from_numpy(
+                self.prev_joint_actions[indices]
+            ).to(self.device)
 
         return batch
 
