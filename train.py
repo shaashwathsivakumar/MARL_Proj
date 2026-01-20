@@ -96,19 +96,42 @@ def compute_running_reward(rewards, window=100):
     return running
 
 
+def get_algorithm_name(args):
+    """Determine algorithm name based on flags or explicit argument."""
+    if args.algorithm:
+        return args.algorithm
+
+    # Auto-detect based on flags
+    if args.use_geometric_sampling and args.use_prev_action:
+        return 'maddpg_geometric_prev_action'
+    elif args.use_geometric_sampling:
+        return 'maddpg_geometric'
+    elif args.use_prev_action:
+        return 'maddpg_prev_action'
+    else:
+        return 'maddpg'
+
+
 def train(args):
     """Main training loop."""
-    # Setup results directory
-    env_dir = os.path.join('./results', args.env_name)
+    # Determine algorithm name
+    algorithm = get_algorithm_name(args)
+
+    # Setup results directory: results/<algorithm>/<env_name>/<run_num>
+    algo_dir = os.path.join('./results', algorithm)
+    env_dir = os.path.join(algo_dir, args.env_name)
     os.makedirs(env_dir, exist_ok=True)
-    run_num = len(os.listdir(env_dir)) + 1
+    run_num = len([d for d in os.listdir(env_dir) if os.path.isdir(os.path.join(env_dir, d))]) + 1
     result_dir = os.path.join(env_dir, str(run_num))
     os.makedirs(result_dir)
 
     # Save training arguments for reproducibility
+    args_dict = vars(args).copy()
+    args_dict['algorithm'] = algorithm  # Store the resolved algorithm name
     with open(os.path.join(result_dir, 'args.json'), 'w') as f:
-        json.dump(vars(args), f, indent=2)
+        json.dump(args_dict, f, indent=2)
 
+    print(f"Algorithm: {algorithm}")
     print(f"Results will be saved to: {result_dir}")
 
     # Create environment
@@ -352,6 +375,12 @@ def main():
                         help='Decay rate for geometric sampling (higher = more bias to recent)')
     parser.add_argument('--use_prev_action', action='store_true',
                         help='Condition critic on previous joint action')
+
+    # Algorithm naming (auto-detected from flags if not specified)
+    parser.add_argument('--algorithm', type=str, default=None,
+                        choices=['maddpg', 'maddpg_geometric', 'maddpg_prev_action',
+                                 'maddpg_geometric_prev_action'],
+                        help='Algorithm name for results organization (auto-detected if not specified)')
 
     # Misc
     parser.add_argument('--device', type=str, default='cpu',

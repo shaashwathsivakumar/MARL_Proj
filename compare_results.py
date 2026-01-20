@@ -11,7 +11,14 @@ Usage:
 import argparse
 import os
 import pickle
+import sys
 import numpy as np
+
+# Handle numpy version compatibility for pickled files
+# Newer numpy (2.x) uses numpy._core, older uses numpy.core
+if not hasattr(np, '_core'):
+    sys.modules['numpy._core'] = np.core
+    sys.modules['numpy._core.multiarray'] = np.core.multiarray
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
@@ -26,70 +33,91 @@ def compute_running_reward(rewards, window=100):
 
 
 def load_results(results_dir='./results'):
-    """Load all results from the results directory."""
+    """Load all results from the results directory.
+
+    New structure: results/<algorithm>/<env_name>/<run_id>/
+    Returns: {algorithm: {env_name: {run_id: data}}}
+    """
     results = {}
 
-    for env_name in sorted(os.listdir(results_dir)):
-        env_path = os.path.join(results_dir, env_name)
-        if not os.path.isdir(env_path):
+    for algorithm in sorted(os.listdir(results_dir)):
+        algo_path = os.path.join(results_dir, algorithm)
+        if not os.path.isdir(algo_path):
             continue
 
-        results[env_name] = {}
+        results[algorithm] = {}
 
-        for run_id in sorted(os.listdir(env_path)):
-            run_path = os.path.join(env_path, run_id)
-            if not os.path.isdir(run_path):
+        for env_name in sorted(os.listdir(algo_path)):
+            env_path = os.path.join(algo_path, env_name)
+            if not os.path.isdir(env_path):
                 continue
 
-            rewards_path = os.path.join(run_path, 'rewards.pkl')
-            if not os.path.exists(rewards_path):
-                continue
+            results[algorithm][env_name] = {}
 
-            with open(rewards_path, 'rb') as f:
-                data = pickle.load(f)
+            for run_id in sorted(os.listdir(env_path)):
+                run_path = os.path.join(env_path, run_id)
+                if not os.path.isdir(run_path):
+                    continue
 
-            # Handle both old and new format
-            if isinstance(data, dict) and 'agent_score' in data:
-                results[env_name][run_id] = data
-            else:
-                print(f"Warning: Old format in {env_name}/{run_id}, skipping")
-                continue
+                rewards_path = os.path.join(run_path, 'rewards.pkl')
+                if not os.path.exists(rewards_path):
+                    continue
+
+                with open(rewards_path, 'rb') as f:
+                    data = pickle.load(f)
+
+                # Handle both old and new format
+                if isinstance(data, dict) and 'agent_score' in data:
+                    results[algorithm][env_name][run_id] = data
+                else:
+                    print(f"Warning: Old format in {algorithm}/{env_name}/{run_id}, skipping")
+                    continue
 
     return results
 
 
 def print_agent_score_table(results, last_n=1000):
-    """Print table of agent scores (Table-style like MADDPG paper)."""
-    print("\n" + "=" * 90)
-    print("TABLE: Agent Scores (mean ± std of last {} episodes)".format(last_n))
-    print("=" * 90)
-    print(f"{'Environment':<30} {'Algorithm':<15} {'Agent Score':>20} {'Adversary Score':>20}")
-    print("-" * 90)
+    """Print table of agent scores grouped by environment for algorithm comparison."""
+    print("\n" + "=" * 100)
+    print("TABLE: Agent Scores by Environment (mean ± std of last {} episodes)".format(last_n))
+    print("=" * 100)
 
-    for env_name in sorted(results.keys()):
-        for run_id in sorted(results[env_name].keys()):
-            data = results[env_name][run_id]
-            agent_scores = data['agent_score']
-            adversary_scores = data['adversary_score']
+    # Get all environments across all algorithms
+    all_envs = set()
+    for algo_data in results.values():
+        all_envs.update(algo_data.keys())
 
-            n = min(last_n, len(agent_scores))
-            mean_agent = np.mean(agent_scores[-n:])
-            std_agent = np.std(agent_scores[-n:])
+    for env_name in sorted(all_envs):
+        print(f"\n--- {env_name} ---")
+        print(f"{'Algorithm':<35} {'Agent Score':>25} {'Adversary Score':>25}")
+        print("-" * 90)
 
-            agent_str = f"{mean_agent:>8.2f} ± {std_agent:<8.2f}"
+        for algorithm in sorted(results.keys()):
+            if env_name not in results[algorithm]:
+                continue
 
-            if len(data.get('adversary_team', [])) > 0:
-                mean_adv = np.mean(adversary_scores[-n:])
-                std_adv = np.std(adversary_scores[-n:])
-                adv_str = f"{mean_adv:>8.2f} ± {std_adv:<8.2f}"
-            else:
-                adv_str = "N/A"
+            for run_id in sorted(results[algorithm][env_name].keys()):
+                data = results[algorithm][env_name][run_id]
+                agent_scores = data['agent_score']
+                adversary_scores = data['adversary_score']
 
-            # Use run_id as algorithm name for now (can be customized)
-            algorithm = f"MADDPG (run {run_id})"
-            print(f"{env_name:<30} {algorithm:<15} {agent_str:>20} {adv_str:>20}")
+                n = min(last_n, len(agent_scores))
+                mean_agent = np.mean(agent_scores[-n:])
+                std_agent = np.std(agent_scores[-n:])
 
-    print("=" * 90)
+                agent_str = f"{mean_agent:>10.2f} ± {std_agent:<10.2f}"
+
+                if len(data.get('adversary_team', [])) > 0:
+                    mean_adv = np.mean(adversary_scores[-n:])
+                    std_adv = np.std(adversary_scores[-n:])
+                    adv_str = f"{mean_adv:>10.2f} ± {std_adv:<10.2f}"
+                else:
+                    adv_str = "N/A"
+
+                algo_label = f"{algorithm} (run {run_id})"
+                print(f"{algo_label:<35} {agent_str:>25} {adv_str:>25}")
+
+    print("\n" + "=" * 100)
 
 
 def print_metrics_table(results, last_n=1000):
@@ -97,12 +125,13 @@ def print_metrics_table(results, last_n=1000):
     # Group by environment type
     env_metrics = defaultdict(list)
 
-    for env_name in sorted(results.keys()):
-        for run_id in sorted(results[env_name].keys()):
-            data = results[env_name][run_id]
-            metrics = data.get('metrics', {})
-            if metrics:
-                env_metrics[env_name].append((run_id, metrics))
+    for algorithm in sorted(results.keys()):
+        for env_name in sorted(results[algorithm].keys()):
+            for run_id in sorted(results[algorithm][env_name].keys()):
+                data = results[algorithm][env_name][run_id]
+                metrics = data.get('metrics', {})
+                if metrics and any(len(v) > 0 if hasattr(v, '__len__') else True for v in metrics.values()):
+                    env_metrics[env_name].append((algorithm, run_id, metrics))
 
     if not env_metrics:
         print("\nNo task-specific metrics found. Run training with updated code to collect metrics.")
@@ -110,136 +139,231 @@ def print_metrics_table(results, last_n=1000):
 
     # Print metrics tables by environment
     for env_name, runs in env_metrics.items():
-        print(f"\n{'='*70}")
+        print(f"\n{'='*80}")
         print(f"TABLE: {env_name} - Task-Specific Metrics")
-        print(f"{'='*70}")
+        print(f"{'='*80}")
 
         # Get metric names from first run
-        metric_names = list(runs[0][1].keys())
+        metric_names = list(runs[0][2].keys())
 
         # Header
-        header = f"{'Algorithm':<20}"
+        header = f"{'Algorithm':<35}"
         for name in metric_names:
-            header += f" {name:>15}"
+            header += f" {name:>12}"
         print(header)
-        print("-" * 70)
+        print("-" * 80)
 
         # Data rows
-        for run_id, metrics in runs:
-            row = f"{'MADDPG (run ' + run_id + ')':<20}"
+        for algorithm, run_id, metrics in runs:
+            row = f"{algorithm} (run {run_id})"[:35].ljust(35)
             for name in metric_names:
                 if name in metrics:
                     values = metrics[name]
-                    n = min(last_n, len(values))
-                    mean_val = np.mean(values[-n:])
-                    row += f" {mean_val:>15.2f}"
+                    if hasattr(values, '__len__') and len(values) > 0:
+                        n = min(last_n, len(values))
+                        mean_val = np.mean(values[-n:])
+                        row += f" {mean_val:>12.2f}"
+                    else:
+                        row += f" {'N/A':>12}"
                 else:
-                    row += f" {'N/A':>15}"
+                    row += f" {'N/A':>12}"
             print(row)
 
-        print("=" * 70)
+        print("=" * 80)
 
 
 def print_predator_prey_table(results, last_n=1000):
     """Print predator-prey specific table (like Table 3 in MADDPG paper)."""
-    if 'simple_tag_v3' not in results:
+    # Check if any algorithm has simple_tag_v3
+    has_data = any('simple_tag_v3' in algo_data for algo_data in results.values())
+    if not has_data:
         return
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("TABLE: Predator-Prey (simple_tag_v3)")
     print("Average number of prey catches per episode")
-    print("=" * 60)
-    print(f"{'Algorithm':<25} {'Catches':>15} {'Prey Survival':>15}")
-    print("-" * 60)
+    print("=" * 70)
+    print(f"{'Algorithm':<35} {'Catches':>15} {'Prey Survival':>15}")
+    print("-" * 70)
 
-    for run_id, data in results['simple_tag_v3'].items():
-        metrics = data.get('metrics', {})
-        if 'num_catches' in metrics:
-            catches = metrics['num_catches']
-            n = min(last_n, len(catches))
-            mean_catches = np.mean(catches[-n:])
+    for algorithm in sorted(results.keys()):
+        if 'simple_tag_v3' not in results[algorithm]:
+            continue
+        for run_id, data in results[algorithm]['simple_tag_v3'].items():
+            metrics = data.get('metrics', {})
+            if 'num_catches' in metrics and len(metrics['num_catches']) > 0:
+                catches = metrics['num_catches']
+                n = min(last_n, len(catches))
+                mean_catches = np.mean(catches[-n:])
 
-            survival = metrics.get('prey_survival_rate', [])
-            if survival:
-                mean_survival = np.mean(survival[-n:])
-                surv_str = f"{mean_survival:.2%}"
-            else:
-                surv_str = "N/A"
+                survival = metrics.get('prey_survival_rate', [])
+                if len(survival) > 0:
+                    mean_survival = np.mean(survival[-n:])
+                    surv_str = f"{mean_survival:.2%}"
+                else:
+                    surv_str = "N/A"
 
-            print(f"{'MADDPG (run ' + run_id + ')':<25} {mean_catches:>15.2f} {surv_str:>15}")
+                algo_label = f"{algorithm} (run {run_id})"
+                print(f"{algo_label:<35} {mean_catches:>15.2f} {surv_str:>15}")
 
-    print("=" * 60)
+    print("=" * 70)
 
 
 def print_crypto_table(results, last_n=1000):
     """Print covert communication table (like Table 5 in MADDPG paper)."""
-    if 'simple_crypto_v3' not in results:
+    has_data = any('simple_crypto_v3' in algo_data for algo_data in results.values())
+    if not has_data:
         return
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("TABLE: Covert Communication (simple_crypto_v3)")
     print("Bob (agent) and Eve (adversary) success metrics")
-    print("=" * 60)
-    print(f"{'Algorithm':<25} {'Bob Reward':>15} {'Eve Reward':>15}")
-    print("-" * 60)
+    print("=" * 70)
+    print(f"{'Algorithm':<35} {'Bob Reward':>15} {'Eve Reward':>15}")
+    print("-" * 70)
 
-    for run_id, data in results['simple_crypto_v3'].items():
-        metrics = data.get('metrics', {})
-        bob_reward = metrics.get('bob_reward', [])
-        eve_reward = metrics.get('eve_reward', [])
+    for algorithm in sorted(results.keys()):
+        if 'simple_crypto_v3' not in results[algorithm]:
+            continue
+        for run_id, data in results[algorithm]['simple_crypto_v3'].items():
+            metrics = data.get('metrics', {})
+            bob_reward = metrics.get('bob_reward', [])
+            eve_reward = metrics.get('eve_reward', [])
 
-        if bob_reward:
-            n = min(last_n, len(bob_reward))
-            mean_bob = np.mean(bob_reward[-n:])
-            mean_eve = np.mean(eve_reward[-n:]) if eve_reward else 0
-            print(f"{'MADDPG (run ' + run_id + ')':<25} {mean_bob:>15.2f} {mean_eve:>15.2f}")
+            if len(bob_reward) > 0:
+                n = min(last_n, len(bob_reward))
+                mean_bob = np.mean(bob_reward[-n:])
+                mean_eve = np.mean(eve_reward[-n:]) if len(eve_reward) > 0 else 0
+                algo_label = f"{algorithm} (run {run_id})"
+                print(f"{algo_label:<35} {mean_bob:>15.2f} {mean_eve:>15.2f}")
 
-    print("=" * 60)
+    print("=" * 70)
 
 
 def print_adversary_table(results, last_n=1000):
     """Print physical deception table (like Table 4 in MADDPG paper)."""
-    if 'simple_adversary_v3' not in results:
+    has_data = any('simple_adversary_v3' in algo_data for algo_data in results.values())
+    if not has_data:
         return
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("TABLE: Physical Deception (simple_adversary_v3)")
     print("Agent vs Adversary performance")
-    print("=" * 60)
-    print(f"{'Algorithm':<25} {'Agent Wins':>15} {'Agent Reward':>15}")
-    print("-" * 60)
+    print("=" * 70)
+    print(f"{'Algorithm':<35} {'Agent Wins':>15} {'Agent Reward':>15}")
+    print("-" * 70)
 
-    for run_id, data in results['simple_adversary_v3'].items():
-        metrics = data.get('metrics', {})
-        agent_success = metrics.get('agent_success', [])
-        agent_reward = metrics.get('agent_reward', [])
+    for algorithm in sorted(results.keys()):
+        if 'simple_adversary_v3' not in results[algorithm]:
+            continue
+        for run_id, data in results[algorithm]['simple_adversary_v3'].items():
+            metrics = data.get('metrics', {})
+            agent_success = metrics.get('agent_success', [])
+            agent_reward = metrics.get('agent_reward', [])
 
-        if agent_success:
-            n = min(last_n, len(agent_success))
-            win_rate = np.mean(agent_success[-n:])
-            mean_reward = np.mean(agent_reward[-n:]) if agent_reward else 0
-            print(f"{'MADDPG (run ' + run_id + ')':<25} {win_rate:>14.2%} {mean_reward:>15.2f}")
+            if len(agent_success) > 0:
+                n = min(last_n, len(agent_success))
+                win_rate = np.mean(agent_success[-n:])
+                mean_reward = np.mean(agent_reward[-n:]) if len(agent_reward) > 0 else 0
+                algo_label = f"{algorithm} (run {run_id})"
+                print(f"{algo_label:<35} {win_rate:>14.2%} {mean_reward:>15.2f}")
 
-    print("=" * 60)
+    print("=" * 70)
+
+
+def print_table6_metrics(results, last_n=1000):
+    """Print Table 6 style metrics: frame-level adversary performance."""
+    print("\n" + "=" * 80)
+    print("TABLE 6: Adversary Frame-Level Metrics (like MADDPG paper Table 6)")
+    print("=" * 80)
+
+    # (a) Keep-Away: adversary_at_goal_frames
+    has_ka = any('simple_world_comm_v3' in algo_data for algo_data in results.values())
+    if has_ka:
+        print("\n(a) Keep-Away (simple_world_comm_v3)")
+        print("    Average frames adversary occupies goal (higher = better for Adv)")
+        print("-" * 60)
+        print(f"    {'Algorithm':<35} {'Adv at Goal':>15}")
+        print("-" * 60)
+        for algorithm in sorted(results.keys()):
+            if 'simple_world_comm_v3' not in results[algorithm]:
+                continue
+            for run_id, data in results[algorithm]['simple_world_comm_v3'].items():
+                metrics = data.get('metrics', {})
+                adv_frames = metrics.get('adversary_at_goal_frames', [])
+                if len(adv_frames) > 0:
+                    n = min(last_n, len(adv_frames))
+                    mean_frames = np.mean(adv_frames[-n:])
+                    algo_label = f"{algorithm} (run {run_id})"
+                    print(f"    {algo_label:<35} {mean_frames:>15.2f}")
+
+    # (b) Physical Deception: adversary_at_goal_frames
+    has_pd = any('simple_adversary_v3' in algo_data for algo_data in results.values())
+    if has_pd:
+        print("\n(b) Physical Deception (simple_adversary_v3)")
+        print("    Average frames adversary stays at goal (higher = better for Adv)")
+        print("-" * 60)
+        print(f"    {'Algorithm':<35} {'Adv at Goal':>15}")
+        print("-" * 60)
+        for algorithm in sorted(results.keys()):
+            if 'simple_adversary_v3' not in results[algorithm]:
+                continue
+            for run_id, data in results[algorithm]['simple_adversary_v3'].items():
+                metrics = data.get('metrics', {})
+                adv_frames = metrics.get('adversary_at_goal_frames', [])
+                if len(adv_frames) > 0:
+                    n = min(last_n, len(adv_frames))
+                    mean_frames = np.mean(adv_frames[-n:])
+                    algo_label = f"{algorithm} (run {run_id})"
+                    print(f"    {algo_label:<35} {mean_frames:>15.2f}")
+
+    # (c) Predator-Prey: num_collisions
+    has_pp = any('simple_tag_v3' in algo_data for algo_data in results.values())
+    if has_pp:
+        print("\n(c) Predator-Prey (simple_tag_v3)")
+        print("    Average collisions per episode (lower = better for Adv)")
+        print("-" * 60)
+        print(f"    {'Algorithm':<35} {'Collisions':>15}")
+        print("-" * 60)
+        for algorithm in sorted(results.keys()):
+            if 'simple_tag_v3' not in results[algorithm]:
+                continue
+            for run_id, data in results[algorithm]['simple_tag_v3'].items():
+                metrics = data.get('metrics', {})
+                collisions = metrics.get('num_collisions', [])
+                if len(collisions) > 0:
+                    n = min(last_n, len(collisions))
+                    mean_collisions = np.mean(collisions[-n:])
+                    algo_label = f"{algorithm} (run {run_id})"
+                    print(f"    {algo_label:<35} {mean_collisions:>15.3f}")
+
+    print("\n" + "=" * 80)
 
 
 def export_to_csv(results, output_path, last_n=1000):
-    """Export results to CSV file."""
+    """Export results to CSV file.
+
+    Args:
+        results: {algorithm: {env_name: {run_id: data}}}
+        output_path: Path to write CSV file
+        last_n: Number of last episodes to average
+    """
     import csv
 
     with open(output_path, 'w', newline='') as f:
         writer = csv.writer(f)
 
         # Header
-        header = ['Environment', 'Run', 'Agent Score Mean', 'Agent Score Std',
+        header = ['Algorithm', 'Environment', 'Run', 'Agent Score Mean', 'Agent Score Std',
                   'Adversary Score Mean', 'Adversary Score Std']
 
-        # Get all unique metric names
+        # Get all unique metric names across all algorithms
         all_metrics = set()
-        for env_data in results.values():
-            for run_data in env_data.values():
-                if 'metrics' in run_data:
-                    all_metrics.update(run_data['metrics'].keys())
+        for algo_data in results.values():
+            for env_data in algo_data.values():
+                for run_data in env_data.values():
+                    if 'metrics' in run_data:
+                        all_metrics.update(run_data['metrics'].keys())
 
         for metric in sorted(all_metrics):
             header.extend([f'{metric} Mean', f'{metric} Std'])
@@ -247,63 +371,96 @@ def export_to_csv(results, output_path, last_n=1000):
         writer.writerow(header)
 
         # Data rows
-        for env_name in sorted(results.keys()):
-            for run_id in sorted(results[env_name].keys()):
-                data = results[env_name][run_id]
-                agent_scores = data['agent_score']
-                adversary_scores = data['adversary_score']
+        for algorithm in sorted(results.keys()):
+            for env_name in sorted(results[algorithm].keys()):
+                for run_id in sorted(results[algorithm][env_name].keys()):
+                    data = results[algorithm][env_name][run_id]
+                    agent_scores = data['agent_score']
+                    adversary_scores = data['adversary_score']
 
-                n = min(last_n, len(agent_scores))
+                    n = min(last_n, len(agent_scores))
 
-                row = [
-                    env_name,
-                    run_id,
-                    np.mean(agent_scores[-n:]),
-                    np.std(agent_scores[-n:]),
-                    np.mean(adversary_scores[-n:]) if len(data.get('adversary_team', [])) > 0 else '',
-                    np.std(adversary_scores[-n:]) if len(data.get('adversary_team', [])) > 0 else '',
-                ]
+                    row = [
+                        algorithm,
+                        env_name,
+                        run_id,
+                        np.mean(agent_scores[-n:]),
+                        np.std(agent_scores[-n:]),
+                        np.mean(adversary_scores[-n:]) if len(data.get('adversary_team', [])) > 0 else '',
+                        np.std(adversary_scores[-n:]) if len(data.get('adversary_team', [])) > 0 else '',
+                    ]
 
-                metrics = data.get('metrics', {})
-                for metric in sorted(all_metrics):
-                    if metric in metrics and len(metrics[metric]) > 0:
-                        values = metrics[metric]
-                        n_m = min(last_n, len(values))
-                        row.extend([np.mean(values[-n_m:]), np.std(values[-n_m:])])
-                    else:
-                        row.extend(['', ''])
+                    metrics = data.get('metrics', {})
+                    for metric in sorted(all_metrics):
+                        if metric in metrics and len(metrics[metric]) > 0:
+                            values = metrics[metric]
+                            n_m = min(last_n, len(values))
+                            row.extend([np.mean(values[-n_m:]), np.std(values[-n_m:])])
+                        else:
+                            row.extend(['', ''])
 
-                writer.writerow(row)
+                    writer.writerow(row)
 
     print(f"\nResults exported to: {output_path}")
 
 
 def plot_comparison(results, output_path='comparison.png'):
-    """Plot agent score comparison across environments."""
-    envs = sorted(results.keys())
+    """Plot agent score comparison across algorithms and environments.
 
-    # Collect scores
-    scores = []
-    labels = []
-    for env in envs:
-        for run_id in results[env]:
-            data = results[env][run_id]
-            n = min(1000, len(data['agent_score']))
-            mean_score = np.mean(data['agent_score'][-n:])
-            scores.append(mean_score)
-            labels.append(f"{env}")
+    Args:
+        results: {algorithm: {env_name: {run_id: data}}}
+        output_path: Path to save the comparison plot
+    """
+    # Get all algorithms and environments
+    algorithms = sorted(results.keys())
+    all_envs = set()
+    for algo_data in results.values():
+        all_envs.update(algo_data.keys())
+    environments = sorted(all_envs)
 
-    # Plot
-    fig, ax = plt.subplots(figsize=(14, 6))
-    x = range(len(scores))
-    colors = ['steelblue' if s >= 0 else 'indianred' for s in scores]
-    bars = ax.bar(x, scores, color=colors, alpha=0.8)
+    if not algorithms or not environments:
+        print("No data to plot")
+        return
 
+    # Collect scores: {env: {algo: mean_score}}
+    scores_by_env = {env: {} for env in environments}
+    for algorithm in algorithms:
+        for env_name in environments:
+            if env_name in results[algorithm]:
+                # Average across runs if multiple
+                run_scores = []
+                for run_id, data in results[algorithm][env_name].items():
+                    n = min(1000, len(data['agent_score']))
+                    run_scores.append(np.mean(data['agent_score'][-n:]))
+                scores_by_env[env_name][algorithm] = np.mean(run_scores)
+
+    # Create grouped bar chart
+    fig, ax = plt.subplots(figsize=(16, 8))
+
+    x = np.arange(len(environments))
+    width = 0.8 / len(algorithms)  # Width of each bar
+
+    # Color palette for algorithms
+    colors = ['steelblue', 'indianred', 'seagreen', 'orange', 'purple', 'brown']
+
+    for i, algorithm in enumerate(algorithms):
+        scores = []
+        for env in environments:
+            scores.append(scores_by_env[env].get(algorithm, 0))
+
+        offset = (i - len(algorithms) / 2 + 0.5) * width
+        bars = ax.bar(x + offset, scores, width, label=algorithm,
+                      color=colors[i % len(colors)], alpha=0.8)
+
+    ax.set_xlabel('Environment', fontsize=12)
+    ax.set_ylabel('Agent Score (mean of last 1000 episodes)', fontsize=12)
+    ax.set_title('Algorithm Comparison: Agent Score Across Environments', fontsize=14)
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=9)
-    ax.set_ylabel('Agent Score (mean of last 1000 episodes)')
-    ax.set_title('MADDPG Agent Score Comparison Across Environments')
+    ax.set_xticklabels([env.replace('_v3', '').replace('_v4', '').replace('simple_', '')
+                        for env in environments],
+                       rotation=45, ha='right', fontsize=10)
     ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax.legend(loc='upper right', fontsize=10)
     ax.grid(True, alpha=0.3, axis='y')
 
     plt.tight_layout()
@@ -344,6 +501,7 @@ def main():
     print_predator_prey_table(results, args.last_n)
     print_crypto_table(results, args.last_n)
     print_adversary_table(results, args.last_n)
+    print_table6_metrics(results, args.last_n)
 
     # Export to CSV
     if args.csv:

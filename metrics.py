@@ -83,7 +83,8 @@ class SimpleTagMetrics(MetricsTracker):
     """
     Metrics for predator-prey (simple_tag_v3):
     - num_catches: Number of times predators caught the prey
-    - prey_survival_steps: How many steps prey survived
+    - prey_survival_rate: Fraction of steps prey survived
+    - num_collisions: Number of collisions between adversaries (Table 6c in paper)
     """
 
     def __init__(self, env_name, agent_ids):
@@ -94,34 +95,49 @@ class SimpleTagMetrics(MetricsTracker):
     def reset_episode(self):
         super().reset_episode()
         self.num_catches = 0
-        self.prev_adversary_rewards = None
+        self.num_collisions = 0
 
     def update(self, obs, actions, rewards, next_obs, dones, env=None):
         super().update(obs, actions, rewards, next_obs, dones, env)
         # In simple_tag, adversaries get +10 reward per catch
         # Detect catches by checking for +10 reward spikes
+        catch_this_step = False
         for adv_id in self.adversary_ids:
             if adv_id in rewards:
                 if rewards[adv_id] >= 10:
-                    self.num_catches += 1
-                    break  # Count once per timestep even if multiple adversaries touch
+                    catch_this_step = True
+                    break
+        if catch_this_step:
+            self.num_catches += 1
+
+        # Detect collisions: adversaries get -1 penalty for collisions
+        # Count collision events (negative reward component from collisions)
+        for adv_id in self.adversary_ids:
+            if adv_id in rewards:
+                # Collision penalty is typically -1 per collision
+                # If reward is negative and not from distance, likely collision
+                reward = rewards[adv_id]
+                if reward < 0 and reward > -1.5:  # Small negative = collision penalty
+                    self.num_collisions += 1
 
     def get_episode_metrics(self):
         return {
             'num_catches': self.num_catches,
             'prey_survival_rate': 1.0 - (self.num_catches / max(1, self.step_count)),
+            'num_collisions': self.num_collisions,
         }
 
     @staticmethod
     def get_metric_names():
-        return ['num_catches', 'prey_survival_rate']
+        return ['num_catches', 'prey_survival_rate', 'num_collisions']
 
 
 class SimpleAdversaryMetrics(MetricsTracker):
     """
     Metrics for physical deception (simple_adversary_v3):
     - agent_success: Whether agents reached target without adversary
-    - adversary_success: Whether adversary reached target
+    - adversary_at_goal_frames: Frames adversary stays at goal (Table 6b in paper)
+    - agent_reward / adversary_reward: Cumulative rewards
     """
 
     def __init__(self, env_name, agent_ids):
@@ -131,20 +147,23 @@ class SimpleAdversaryMetrics(MetricsTracker):
 
     def reset_episode(self):
         super().reset_episode()
-        self.agent_reached_target = False
-        self.adversary_reached_target = False
         self.cumulative_agent_reward = 0
         self.cumulative_adversary_reward = 0
+        self.adversary_at_goal_frames = 0
 
     def update(self, obs, actions, rewards, next_obs, dones, env=None):
         super().update(obs, actions, rewards, next_obs, dones, env)
-        # Track cumulative rewards - positive agent reward means reaching target
+        # Track cumulative rewards
         for agent_id in self.agent_team:
             if agent_id in rewards:
                 self.cumulative_agent_reward += rewards[agent_id]
         for adv_id in self.adversary_team:
             if adv_id in rewards:
                 self.cumulative_adversary_reward += rewards[adv_id]
+                # Adversary gets positive reward when at target landmark
+                # High positive reward indicates adversary is at goal
+                if rewards[adv_id] > 0:
+                    self.adversary_at_goal_frames += 1
 
     def get_episode_metrics(self):
         # Agent success if they accumulated more reward than adversary
@@ -153,11 +172,12 @@ class SimpleAdversaryMetrics(MetricsTracker):
             'agent_success': agent_success,
             'agent_reward': self.cumulative_agent_reward,
             'adversary_reward': self.cumulative_adversary_reward,
+            'adversary_at_goal_frames': self.adversary_at_goal_frames,
         }
 
     @staticmethod
     def get_metric_names():
-        return ['agent_success', 'agent_reward', 'adversary_reward']
+        return ['agent_success', 'agent_reward', 'adversary_reward', 'adversary_at_goal_frames']
 
 
 class SimpleCryptoMetrics(MetricsTracker):
@@ -293,9 +313,10 @@ class SimpleSpeakerListenerMetrics(MetricsTracker):
 
 class SimpleWorldCommMetrics(MetricsTracker):
     """
-    Metrics for world comm (simple_world_comm_v3):
-    - agent_survival: How well agents evade adversaries
-    - food_collected: Amount of food collected by agents
+    Metrics for world comm / keep-away (simple_world_comm_v3):
+    - agent_reward / adversary_reward: Cumulative rewards
+    - num_catches: Times adversaries caught agents
+    - adversary_at_goal_frames: Frames adversary occupies goal/food (Table 6a in paper)
     """
 
     def __init__(self, env_name, agent_ids):
@@ -308,6 +329,7 @@ class SimpleWorldCommMetrics(MetricsTracker):
         self.agent_reward = 0
         self.adversary_reward = 0
         self.num_catches = 0
+        self.adversary_at_goal_frames = 0
 
     def update(self, obs, actions, rewards, next_obs, dones, env=None):
         super().update(obs, actions, rewards, next_obs, dones, env)
@@ -320,17 +342,22 @@ class SimpleWorldCommMetrics(MetricsTracker):
                 # Detect catches (positive reward spikes for adversaries)
                 if rewards[adv_id] >= 5:
                     self.num_catches += 1
+                # Track frames where adversary is at goal (getting food reward)
+                # Adversary gets reward for being near food/goal
+                if rewards[adv_id] > 0:
+                    self.adversary_at_goal_frames += 1
 
     def get_episode_metrics(self):
         return {
             'agent_reward': self.agent_reward,
             'adversary_reward': self.adversary_reward,
             'num_catches': self.num_catches,
+            'adversary_at_goal_frames': self.adversary_at_goal_frames,
         }
 
     @staticmethod
     def get_metric_names():
-        return ['agent_reward', 'adversary_reward', 'num_catches']
+        return ['agent_reward', 'adversary_reward', 'num_catches', 'adversary_at_goal_frames']
 
 
 class SimpleMetrics(MetricsTracker):

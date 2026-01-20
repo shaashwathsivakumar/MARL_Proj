@@ -3,6 +3,7 @@ Evaluation script for trained MADDPG models.
 Loads saved models and generates GIFs of agent behavior.
 """
 import argparse
+import json
 import os
 
 import numpy as np
@@ -73,10 +74,12 @@ def make_env(env_name, max_cycles=25, render_mode='rgb_array'):
 
 def evaluate(args):
     """Run evaluation episodes and generate GIFs."""
-    # Verify model directory exists
-    model_dir = os.path.join('./results', args.env_name, args.run_id)
+    # Verify model directory exists: results/<algorithm>/<env_name>/<run_id>
+    model_dir = os.path.join('./results', args.algorithm, args.env_name, args.run_id)
     if not os.path.exists(model_dir):
         raise FileNotFoundError(f"Model directory not found: {model_dir}")
+
+    print(f"Algorithm: {args.algorithm}")
 
     # Setup GIF directory
     gif_dir = os.path.join(model_dir, 'gif')
@@ -89,13 +92,22 @@ def evaluate(args):
     )
     agent_ids = list(obs_dims.keys())
 
+    # Load training args to get model configuration
+    args_path = os.path.join(model_dir, 'args.json')
+    use_prev_action = False
+    if os.path.exists(args_path):
+        with open(args_path, 'r') as f:
+            train_args = json.load(f)
+            use_prev_action = train_args.get('use_prev_action', False)
+
     # Initialize and load MADDPG
     maddpg = MADDPG(
         agent_ids=agent_ids,
         obs_dims=obs_dims,
         action_dims=action_dims,
         buffer_capacity=1,  # Not used for evaluation
-        device=args.device
+        device=args.device,
+        use_prev_action=use_prev_action
     )
     maddpg.load(model_dir)
     print(f"Loaded model from: {model_dir}")
@@ -223,6 +235,10 @@ def evaluate(args):
 def main():
     parser = argparse.ArgumentParser(description='Evaluate trained MADDPG model')
 
+    parser.add_argument('algorithm', type=str,
+                        choices=['maddpg', 'maddpg_geometric', 'maddpg_prev_action',
+                                 'maddpg_geometric_prev_action'],
+                        help='Algorithm name (results/<algorithm>/...)')
     parser.add_argument('env_name', type=str,
                         choices=[
                             'simple_v3',
@@ -237,7 +253,7 @@ def main():
                         ],
                         help='Environment name')
     parser.add_argument('run_id', type=str,
-                        help='Run ID (folder name in results/env_name/)')
+                        help='Run ID (folder name in results/<algorithm>/<env_name>/)')
     parser.add_argument('--num_episodes', type=int, default=5,
                         help='Number of evaluation episodes')
     parser.add_argument('--episode_length', type=int, default=50,
