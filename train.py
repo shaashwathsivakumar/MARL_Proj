@@ -102,14 +102,18 @@ def get_algorithm_name(args):
         return args.algorithm
 
     # Auto-detect based on flags
-    if args.use_geometric_sampling and args.use_prev_action:
-        return 'maddpg_geometric_prev_action'
-    elif args.use_geometric_sampling:
-        return 'maddpg_geometric'
-    elif args.use_prev_action:
-        return 'maddpg_prev_action'
-    else:
-        return 'maddpg'
+    parts = ['maddpg']
+
+    if args.shared_actor:
+        parts.append('shared_actor')
+    if args.use_geometric_sampling:
+        parts.append('geometric')
+    if args.use_prev_action:
+        parts.append('prev_action')
+    if args.use_prev_observation:
+        parts.append('prev_observation')
+
+    return '_'.join(parts)
 
 
 def train(args):
@@ -160,7 +164,10 @@ def train(args):
         device=args.device,
         geometric_sampling=args.use_geometric_sampling,
         geo_alpha=args.geo_alpha,
-        use_prev_action=args.use_prev_action
+        use_prev_action=args.use_prev_action,
+        use_prev_obs=args.use_prev_observation,
+        shared_actor=args.shared_actor,
+        env_name=args.env_name
     )
 
     # Compute total action dim for prev_joint_action tracking
@@ -186,6 +193,9 @@ def train(args):
         # Initialize previous joint action (zeros at episode start)
         prev_joint_action = np.zeros(total_action_dim, dtype=np.float32) if args.use_prev_action else None
 
+        # Initialize previous observations (zeros at episode start)
+        prev_observations = {agent: np.zeros(obs_dims[agent], dtype=np.float32) for agent in agent_ids} if args.use_prev_observation else None
+
         while env.agents:
             global_step += 1
 
@@ -193,7 +203,7 @@ def train(args):
             if global_step < args.warmup_steps:
                 actions = {agent: env.action_space(agent).sample() for agent in env.agents}
             else:
-                actions = maddpg.select_actions(obs, explore=True)
+                actions = maddpg.select_actions(obs, prev_observations, explore=True)
 
             # Environment step
             next_obs, rewards, terminations, truncations, _ = env.step(actions)
@@ -204,8 +214,8 @@ def train(args):
             # Update environment-specific metrics
             metrics_tracker.update(obs, actions, rewards, next_obs, dones, env)
 
-            # Store transition (with previous joint action if enabled)
-            maddpg.store_transition(obs, actions, rewards, next_obs, dones, prev_joint_action)
+            # Store transition (with previous joint action and previous observations if enabled)
+            maddpg.store_transition(obs, actions, rewards, next_obs, dones, prev_joint_action, prev_observations)
 
             # Update prev_joint_action for next step (concatenate current actions as one-hot)
             if args.use_prev_action:
@@ -219,6 +229,10 @@ def train(args):
                     else:
                         prev_joint_action.append(action)
                 prev_joint_action = np.concatenate(prev_joint_action)
+
+            # Update prev_observations for next step
+            if args.use_prev_observation:
+                prev_observations = {agent: obs[agent].copy() for agent in agent_ids}
 
             # Accumulate rewards
             for agent in rewards.keys():
@@ -369,17 +383,30 @@ def main():
                         help='Critic learning rate')
 
     # Enhancements
+    parser.add_argument('--shared_actor', action='store_true',
+                        help='Share actor network within agent/adversary teams')
     parser.add_argument('--use_geometric_sampling', action='store_true',
                         help='Use geometric distribution for replay sampling')
     parser.add_argument('--geo_alpha', type=float, default=1e-5,
                         help='Decay rate for geometric sampling (higher = more bias to recent)')
     parser.add_argument('--use_prev_action', action='store_true',
                         help='Condition critic on previous joint action')
+    parser.add_argument('--use_prev_observation', action='store_true',
+                        help='Condition actor on previous observation')
 
     # Algorithm naming (auto-detected from flags if not specified)
     parser.add_argument('--algorithm', type=str, default=None,
                         choices=['maddpg', 'maddpg_geometric', 'maddpg_prev_action',
-                                 'maddpg_geometric_prev_action'],
+                                 'maddpg_prev_observation', 'maddpg_geometric_prev_action',
+                                 'maddpg_geometric_prev_observation',
+                                 'maddpg_prev_action_prev_observation',
+                                 'maddpg_geometric_prev_action_prev_observation',
+                                 'maddpg_shared_actor', 'maddpg_shared_actor_geometric',
+                                 'maddpg_shared_actor_prev_action', 'maddpg_shared_actor_prev_observation',
+                                 'maddpg_shared_actor_geometric_prev_action',
+                                 'maddpg_shared_actor_geometric_prev_observation',
+                                 'maddpg_shared_actor_prev_action_prev_observation',
+                                 'maddpg_shared_actor_geometric_prev_action_prev_observation'],
                         help='Algorithm name for results organization (auto-detected if not specified)')
 
     # Misc

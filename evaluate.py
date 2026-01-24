@@ -1,6 +1,9 @@
 """
-Evaluation script for trained MADDPG models.
+Evaluation script for trained MADDPG and mixed-algorithm models.
 Loads saved models and generates GIFs of agent behavior.
+
+Supports both single-algorithm models (from train.py) and
+mixed-algorithm models (from train_mixed.py).
 """
 import argparse
 import json
@@ -23,6 +26,7 @@ from pettingzoo.mpe import (
 
 from maddpg import MADDPG
 from metrics import create_metrics_tracker, get_all_metric_names
+from algorithms import create_team_algorithm, get_available_algorithms
 
 
 # Agent team definitions (same as train.py)
@@ -72,6 +76,19 @@ def make_env(env_name, max_cycles=25, render_mode='rgb_array'):
     return env, obs_dims, action_dims
 
 
+def is_mixed_algorithm(algorithm_name):
+    """Check if algorithm name is a mixed-algorithm combination (e.g., 'maddpg_vs_ddpg')."""
+    return '_vs_' in algorithm_name
+
+
+def parse_mixed_algorithms(algorithm_name):
+    """Parse a mixed-algorithm name into agent and adversary algorithms."""
+    parts = algorithm_name.split('_vs_')
+    if len(parts) != 2:
+        raise ValueError(f"Invalid mixed algorithm name: {algorithm_name}")
+    return parts[0], parts[1]
+
+
 def evaluate(args):
     """Run evaluation episodes and generate GIFs."""
     # Verify model directory exists: results/<algorithm>/<env_name>/<run_id>
@@ -95,22 +112,97 @@ def evaluate(args):
     # Load training args to get model configuration
     args_path = os.path.join(model_dir, 'args.json')
     use_prev_action = False
+    use_prev_obs = False
+    shared_actor = False
+    env_name = args.env_name
+    train_args = {}
     if os.path.exists(args_path):
         with open(args_path, 'r') as f:
             train_args = json.load(f)
             use_prev_action = train_args.get('use_prev_action', False)
+            use_prev_obs = train_args.get('use_prev_observation', False)
+            shared_actor = train_args.get('shared_actor', False)
+            env_name = train_args.get('env_name', args.env_name)
 
-    # Initialize and load MADDPG
-    maddpg = MADDPG(
-        agent_ids=agent_ids,
-        obs_dims=obs_dims,
-        action_dims=action_dims,
-        buffer_capacity=1,  # Not used for evaluation
-        device=args.device,
-        use_prev_action=use_prev_action
-    )
-    maddpg.load(model_dir)
-    print(f"Loaded model from: {model_dir}")
+    # Determine if this is a mixed-algorithm model
+    is_mixed = is_mixed_algorithm(args.algorithm)
+
+    if is_mixed:
+        # Load mixed-algorithm models
+        agent_algo_name, adversary_algo_name = parse_mixed_algorithms(args.algorithm)
+        print(f"  Agent algorithm: {agent_algo_name}")
+        print(f"  Adversary algorithm: {adversary_algo_name}")
+
+        # Get team assignments
+        agent_team = get_agent_team(args.env_name, agent_ids)
+        adversary_team = [a for a in agent_ids if a not in agent_team]
+
+        # Create and load agent team algorithm
+        agent_algo = create_team_algorithm(
+            algorithm=agent_algo_name,
+            team_agent_ids=agent_team,
+            all_agent_ids=agent_ids,
+            obs_dims=obs_dims,
+            action_dims=action_dims,
+            buffer_capacity=1,
+            device=args.device
+        )
+        agent_model_dir = os.path.join(model_dir, 'agent_team')
+        if os.path.exists(agent_model_dir):
+            agent_algo.load(agent_model_dir)
+            print(f"Loaded agent team model from: {agent_model_dir}")
+
+        # Create and load adversary team algorithm (if there are adversaries)
+        adversary_algo = None
+        if adversary_team:
+            adversary_algo = create_team_algorithm(
+                algorithm=adversary_algo_name,
+                team_agent_ids=adversary_team,
+                all_agent_ids=agent_ids,
+                obs_dims=obs_dims,
+                action_dims=action_dims,
+                buffer_capacity=1,
+                device=args.device
+            )
+            adversary_model_dir = os.path.join(model_dir, 'adversary_team')
+            if os.path.exists(adversary_model_dir):
+                adversary_algo.load(adversary_model_dir)
+                print(f"Loaded adversary team model from: {adversary_model_dir}")
+
+        # Create action selection function for mixed algorithm
+        # Note: prev_obs is not used for mixed algorithms currently
+        def select_actions(obs, prev_obs=None, explore=False):
+            actions = agent_algo.select_actions(obs, explore=explore)
+            if adversary_algo is not None:
+                adv_actions = adversary_algo.select_actions(obs, explore=explore)
+                actions.update(adv_actions)
+            return actions
+
+        maddpg = None  # Not used for mixed algorithms
+    else:
+        # Load single-algorithm MADDPG model
+        maddpg = MADDPG(
+            agent_ids=agent_ids,
+            obs_dims=obs_dims,
+            action_dims=action_dims,
+            buffer_capacity=1,  # Not used for evaluation
+            device=args.device,
+            use_prev_action=use_prev_action,
+            use_prev_obs=use_prev_obs,
+            shared_actor=shared_actor,
+            env_name=env_name
+        )
+        maddpg.load(model_dir)
+        print(f"Loaded model from: {model_dir}")
+        if shared_actor:
+            print("  Using shared actor networks within teams")
+        if use_prev_obs:
+            print("  Using previous observation conditioning for actor")
+
+        # Create action selection function for single algorithm
+        # Note: prev_observations will be passed from the evaluation loop if use_prev_obs
+        def select_actions(obs, prev_obs=None, explore=False):
+            return maddpg.select_actions(obs, prev_obs, explore=explore)
 
     # Identify agent team for scoring
     agent_team = get_agent_team(args.env_name, agent_ids)
@@ -133,9 +225,12 @@ def evaluate(args):
         metrics_tracker.reset_episode()
         frames = []
 
+        # Initialize previous observations (zeros at episode start)
+        prev_observations = {agent: np.zeros(obs_dims[agent], dtype=np.float32) for agent in agent_ids} if use_prev_obs else None
+
         while env.agents:
             # Select actions (deterministic for evaluation)
-            actions = maddpg.select_actions(obs, explore=False)
+            actions = select_actions(obs, prev_observations, explore=False)
 
             # Step environment
             next_obs, rewards, terminations, truncations, _ = env.step(actions)
@@ -150,6 +245,10 @@ def evaluate(args):
             # Accumulate rewards
             for agent in env.agents:
                 episode_reward[agent] += rewards[agent]
+
+            # Update prev_observations for next step
+            if use_prev_obs:
+                prev_observations = {agent: obs[agent].copy() for agent in agent_ids}
 
             obs = next_obs
 
@@ -232,13 +331,36 @@ def evaluate(args):
     print(f"GIFs saved to: {gif_dir}")
 
 
+def get_valid_algorithms():
+    """Get list of valid algorithm names including mixed combinations."""
+    base_algos = ['maddpg', 'maddpg_geometric', 'maddpg_prev_action',
+                  'maddpg_prev_observation', 'maddpg_geometric_prev_action',
+                  'maddpg_geometric_prev_observation',
+                  'maddpg_prev_action_prev_observation',
+                  'maddpg_geometric_prev_action_prev_observation',
+                  'maddpg_shared_actor', 'maddpg_shared_actor_geometric',
+                  'maddpg_shared_actor_prev_action', 'maddpg_shared_actor_prev_observation',
+                  'maddpg_shared_actor_geometric_prev_action',
+                  'maddpg_shared_actor_geometric_prev_observation',
+                  'maddpg_shared_actor_prev_action_prev_observation',
+                  'maddpg_shared_actor_geometric_prev_action_prev_observation']
+    team_algos = get_available_algorithms()
+
+    # Add mixed algorithm combinations
+    mixed_algos = []
+    for agent_algo in team_algos:
+        for adv_algo in team_algos:
+            mixed_algos.append(f"{agent_algo}_vs_{adv_algo}")
+
+    return base_algos + mixed_algos
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate trained MADDPG model')
+    parser = argparse.ArgumentParser(description='Evaluate trained MADDPG or mixed-algorithm model')
 
     parser.add_argument('algorithm', type=str,
-                        choices=['maddpg', 'maddpg_geometric', 'maddpg_prev_action',
-                                 'maddpg_geometric_prev_action'],
-                        help='Algorithm name (results/<algorithm>/...)')
+                        help='Algorithm name (e.g., maddpg, maddpg_vs_ddpg). '
+                             'For mixed algorithms use format: agent_algo_vs_adversary_algo')
     parser.add_argument('env_name', type=str,
                         choices=[
                             'simple_v3',
