@@ -10,6 +10,7 @@ import json
 import os
 
 import numpy as np
+import torch
 import matplotlib.pyplot as plt
 from PIL import Image
 from pettingzoo.mpe import (
@@ -26,7 +27,7 @@ from pettingzoo.mpe import (
 
 from maddpg import MADDPG
 from metrics import create_metrics_tracker, get_all_metric_names
-from algorithms import create_team_algorithm, get_available_algorithms
+from PTAI import AINet, get_env_ptai_config
 
 
 # Agent team definitions (same as train.py)
@@ -114,6 +115,9 @@ def evaluate(args):
     use_prev_action = False
     use_prev_obs = False
     shared_actor = False
+    use_ai_net = False
+    fellow_mode = 'action'
+    online_ai_net = False
     env_name = args.env_name
     train_args = {}
     if os.path.exists(args_path):
@@ -122,12 +126,20 @@ def evaluate(args):
             use_prev_action = train_args.get('use_prev_action', False)
             use_prev_obs = train_args.get('use_prev_observation', False)
             shared_actor = train_args.get('shared_actor', False)
+            use_ai_net = train_args.get('use_ai_net', False)
+            fellow_mode = train_args.get('fellow_mode', 'action')
+            online_ai_net = train_args.get('online_ai_net', False)
             env_name = train_args.get('env_name', args.env_name)
+
+    # AINet forces prev-observation conditioning on the actor (mirrors maddpg.py)
+    use_prev_obs = use_prev_obs or use_ai_net
 
     # Determine if this is a mixed-algorithm model
     is_mixed = is_mixed_algorithm(args.algorithm)
 
     if is_mixed:
+        from algorithms import create_team_algorithm
+
         # Load mixed-algorithm models
         agent_algo_name, adversary_algo_name = parse_mixed_algorithms(args.algorithm)
         print(f"  Agent algorithm: {agent_algo_name}")
@@ -180,6 +192,30 @@ def evaluate(args):
 
         maddpg = None  # Not used for mixed algorithms
     else:
+        # Load AINet (PTAI) if this model was trained with --use_ai_net
+        ai_net = None
+        sub_assignments = None
+        if use_ai_net:
+            _, cfg = get_env_ptai_config(env_name)
+            self_pos_offsets = dict(enumerate(cfg.get('self_pos_offsets', [0] * cfg['n_agent_types'])))
+            if fellow_mode == 'velocity_analytical':
+                ai_net_path = f'AI_Net_{env_name}_velA.pt'
+            elif fellow_mode == 'velocity_learned':
+                ai_net_path = f'AI_Net_{env_name}_velL.pt'
+            else:
+                ai_net_path = f'AI_Net_{env_name}.pt'
+            checkpoint = torch.load(ai_net_path, map_location=args.device)
+            ai_net = AINet(
+                cfg['n_agent_types'], cfg['agent_types'],
+                cfg['other_sub_sizes'], cfg['slfgbl_sub_sizes'],
+                cfg['action_sub_sizes'], device=args.device,
+                fellow_mode=fellow_mode, self_pos_offsets=self_pos_offsets,
+            )
+            ai_net.load_state_dict(checkpoint['ai_net'])
+            sub_assignments = checkpoint['sub_assignments']
+            ai_net.eval_mode()
+            print(f"  Loaded AI_Net from {ai_net_path} (fellow_mode={fellow_mode})")
+
         # Load single-algorithm MADDPG model
         maddpg = MADDPG(
             agent_ids=agent_ids,
@@ -190,7 +226,10 @@ def evaluate(args):
             use_prev_action=use_prev_action,
             use_prev_obs=use_prev_obs,
             shared_actor=shared_actor,
-            env_name=env_name
+            env_name=env_name,
+            ai_net=ai_net,
+            sub_assignments=sub_assignments,
+            online_ai_net=online_ai_net,
         )
         maddpg.load(model_dir)
         print(f"Loaded model from: {model_dir}")
@@ -333,6 +372,8 @@ def evaluate(args):
 
 def get_valid_algorithms():
     """Get list of valid algorithm names including mixed combinations."""
+    from algorithms import get_available_algorithms
+
     base_algos = ['maddpg', 'maddpg_geometric', 'maddpg_prev_action',
                   'maddpg_prev_observation', 'maddpg_geometric_prev_action',
                   'maddpg_geometric_prev_observation',

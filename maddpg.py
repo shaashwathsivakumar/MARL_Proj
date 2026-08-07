@@ -48,9 +48,10 @@ class MADDPGAgent:
     across multiple agents in a team, with the optimizer managed externally.
     """
     def __init__(self, obs_dim, action_dim, critic_input_dim, actor_lr, critic_lr, device='cpu',
-                 shared_actor=None, shared_target_actor=None):
+                 shared_actor=None, shared_target_actor=None, use_twin_critic=False):
         self.device = device
         self.shared_actor_mode = shared_actor is not None
+        self.use_twin_critic = use_twin_critic
 
         # Actor: use shared or create own
         if shared_actor is not None:
@@ -67,22 +68,27 @@ class MADDPGAgent:
         self.target_critic = deepcopy(self.critic)
         self.critic_optimizer = Adam(self.critic.parameters(), lr=critic_lr)
 
-    def select_action(self, obs, prev_obs=None, explore=True):
+        # TD3-style twin critic: a second, independently-initialized critic
+        # used (via min of both targets) to reduce Q-value overestimation bias.
+        if use_twin_critic:
+            self.critic2 = Critic(critic_input_dim).to(device)
+            self.target_critic2 = deepcopy(self.critic2)
+            self.critic2_optimizer = Adam(self.critic2.parameters(), lr=critic_lr)
+
+    def select_action(self, actor_input, explore=True):
         """
-        Select action given observation.
+        Select action given pre-built actor input (obs, or obs+a_hat, or prev_obs+obs).
 
         Args:
-            obs: Numpy array of observation
-            prev_obs: Optional previous observation for temporal context
+            actor_input: Numpy array — already assembled by MADDPG.select_actions
             explore: Whether to use stochastic action selection
 
         Returns:
             Integer action index
         """
-        # Concatenate previous observation if provided
-        if prev_obs is not None:
-            obs = np.concatenate([prev_obs, obs])
-        obs_tensor = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
+        obs_tensor = torch.from_numpy(
+            np.array(actor_input, dtype=np.float32)
+        ).unsqueeze(0).to(self.device)
         with torch.no_grad():
             action = self.actor.get_action(obs_tensor, explore=explore)
         return action.squeeze(0).argmax().item()
@@ -110,7 +116,10 @@ class MADDPG:
     def __init__(self, agent_ids, obs_dims, action_dims, buffer_capacity,
                  actor_lr=0.01, critic_lr=0.01, device='cpu',
                  geometric_sampling=False, geo_alpha=1e-5, use_prev_action=False,
-                 use_prev_obs=False, shared_actor=False, env_name=None):
+                 use_prev_obs=False, shared_actor=False, env_name=None,
+                 ai_net=None, sub_assignments=None, online_ai_net=False,
+                 use_adversary_gating=False, gating_temperature=0.5,
+                 gating_ema_decay=0.05, use_twin_critic=False, policy_delay=2):
         """
         Args:
             agent_ids: List of agent identifiers
@@ -125,13 +134,52 @@ class MADDPG:
             use_prev_action: Whether to condition critic on previous joint action
             use_prev_obs: Whether to condition actor on previous observation
             shared_actor: Whether to share actor networks within teams
-            env_name: Environment name (required if shared_actor=True for team detection)
+            env_name: Environment name (required if shared_actor=True or
+                use_adversary_gating=True, for team detection)
+            ai_net: Optional pre-trained AINet instance (Algorithm 3)
+            sub_assignments: Dict mapping agent_index -> sub_assign tensor (required if ai_net)
+            use_adversary_gating: Experimental — scale each opponent agent's obs/action
+                features in the critic input by a "trust" gate derived from how much that
+                opponent's action distribution has drifted from its own slow-moving EMA.
+                Intuition: the centralized critic's model of the opponent is least
+                reliable right when the opponent's policy is changing fastest, so its
+                contribution is downweighted then. No effect on agents with no
+                opponent team (e.g. fully cooperative envs).
+            gating_temperature: Controls sensitivity of the gate to drift; smaller values
+                attenuate more aggressively for the same drift magnitude.
+            gating_ema_decay: Update rate of the slow-moving per-agent action EMA used
+                as the drift reference.
+            use_twin_critic: TD3-style (Fujimoto et al. 2018) clipped double Q-learning —
+                each agent gets two independently-initialized critics; the TD target uses
+                the minimum of both targets' predictions (reduces Q-value overestimation
+                bias), and actor + target-network updates are delayed to every
+                `policy_delay` calls to update() (matches the published algorithm). Actor
+                loss still uses critic 1 only. Target policy smoothing (the third TD3
+                component) is intentionally omitted — it's designed for continuous action
+                noise and has no clean analog for this codebase's discrete Gumbel-Softmax
+                actions.
+            policy_delay: Number of update() calls between actor/target-network updates
+                when use_twin_critic is True. Ignored otherwise (every call updates).
         """
         self.agent_ids = agent_ids
         self.obs_dims = obs_dims
         self.action_dims = action_dims
         self.device = device
         self.use_prev_action = use_prev_action
+        self.use_adversary_gating = use_adversary_gating
+        self.gating_temperature = gating_temperature
+        self.gating_ema_decay = gating_ema_decay
+        self.use_twin_critic = use_twin_critic
+        self.policy_delay = policy_delay
+        self._update_step_count = 0
+        self._should_soft_update = True
+        # AI_Net requires prev_obs to be stored in the buffer
+        self.ai_net = ai_net
+        self.sub_assignments = sub_assignments
+        self.use_ai_net    = ai_net is not None
+        self.online_ai_net = online_ai_net and (ai_net is not None)
+        if self.use_ai_net:
+            use_prev_obs = True
         self.use_prev_obs = use_prev_obs
 
         # Handle shared_actor flag
@@ -150,14 +198,50 @@ class MADDPG:
         if use_prev_action:
             critic_input_dim += total_action_dim  # Add space for previous joint action
 
-        # Setup shared actors if enabled
-        if self.shared_actor:
-            # Determine team membership
+        # Determine team membership (needed for shared_actor and/or adversary_gating)
+        if self.shared_actor or self.use_adversary_gating:
             self.agent_team = get_agent_team(env_name, agent_ids) if env_name else agent_ids
             self.adversary_team = [a for a in agent_ids if a not in self.agent_team]
+        else:
+            self.agent_team = None
+            self.adversary_team = None
 
+        # Precompute, for each agent, the set of agent_ids on the *other* team
+        # (used by adversary gating; empty/unused when gating is disabled or the
+        # env has no adversary team, e.g. fully cooperative envs).
+        if self.use_adversary_gating and self.adversary_team:
+            agent_team_set = set(self.agent_team)
+            adversary_team_set = set(self.adversary_team)
+            self._opponent_ids = {
+                aid: (adversary_team_set if aid in agent_team_set else agent_team_set)
+                for aid in agent_ids
+            }
+        else:
+            self._opponent_ids = {}
+
+        # Per-agent offsets into the flat prev_joint_action tensor (matches the
+        # concatenation order used when prev_joint_action is built in train.py).
+        self._action_offsets = {}
+        _offset = 0
+        for aid in agent_ids:
+            self._action_offsets[aid] = _offset
+            _offset += action_dims[aid]
+
+        # Slow-moving EMA of each agent's batch-mean action distribution, used as
+        # the drift reference for adversary gating. Lazily initialized on first use.
+        self.action_emas = {aid: None for aid in agent_ids}
+        self._current_gates = {}
+
+        # Setup shared actors if enabled
+        if self.shared_actor:
             # Create shared actor for agent team
-            agent_obs_dim = obs_dims[self.agent_team[0]] * 2 if use_prev_obs else obs_dims[self.agent_team[0]]
+            if self.use_ai_net:
+                agent_type = ai_net.agent_types[agent_ids.index(self.agent_team[0])]
+                agent_obs_dim = obs_dims[self.agent_team[0]] + ai_net.total_action_dim_by_type[agent_type]
+            elif use_prev_obs:
+                agent_obs_dim = obs_dims[self.agent_team[0]] * 2
+            else:
+                agent_obs_dim = obs_dims[self.agent_team[0]]
             agent_action_dim = action_dims[self.agent_team[0]]
             self.shared_agent_actor = Actor(agent_obs_dim, agent_action_dim).to(device)
             self.shared_agent_target_actor = deepcopy(self.shared_agent_actor)
@@ -165,7 +249,13 @@ class MADDPG:
 
             # Create shared actor for adversary team (if any)
             if self.adversary_team:
-                adv_obs_dim = obs_dims[self.adversary_team[0]] * 2 if use_prev_obs else obs_dims[self.adversary_team[0]]
+                if self.use_ai_net:
+                    adv_type = ai_net.agent_types[agent_ids.index(self.adversary_team[0])]
+                    adv_obs_dim = obs_dims[self.adversary_team[0]] + ai_net.total_action_dim_by_type[adv_type]
+                elif use_prev_obs:
+                    adv_obs_dim = obs_dims[self.adversary_team[0]] * 2
+                else:
+                    adv_obs_dim = obs_dims[self.adversary_team[0]]
                 adv_action_dim = action_dims[self.adversary_team[0]]
                 self.shared_adversary_actor = Actor(adv_obs_dim, adv_action_dim).to(device)
                 self.shared_adversary_target_actor = deepcopy(self.shared_adversary_actor)
@@ -174,14 +264,17 @@ class MADDPG:
                 self.shared_adversary_actor = None
                 self.shared_adversary_target_actor = None
                 self.shared_adversary_actor_optimizer = None
-        else:
-            self.agent_team = None
-            self.adversary_team = None
 
         # Create agents
         self.agents = {}
         for agent_id in agent_ids:
-            actor_obs_dim = obs_dims[agent_id] * 2 if use_prev_obs else obs_dims[agent_id]
+            if self.use_ai_net:
+                agent_type_i = ai_net.agent_types[agent_ids.index(agent_id)]
+                actor_obs_dim = obs_dims[agent_id] + ai_net.total_action_dim_by_type[agent_type_i]
+            elif use_prev_obs:
+                actor_obs_dim = obs_dims[agent_id] * 2
+            else:
+                actor_obs_dim = obs_dims[agent_id]
 
             if self.shared_actor:
                 # Use shared actors
@@ -200,7 +293,8 @@ class MADDPG:
                     critic_lr,
                     device,
                     shared_actor=shared_actor_net,
-                    shared_target_actor=shared_target_actor_net
+                    shared_target_actor=shared_target_actor_net,
+                    use_twin_critic=self.use_twin_critic
                 )
             else:
                 # Individual actors (original behavior)
@@ -210,7 +304,8 @@ class MADDPG:
                     critic_input_dim,
                     actor_lr,
                     critic_lr,
-                    device
+                    device,
+                    use_twin_critic=self.use_twin_critic
                 )
 
         # Shared replay buffer with per-agent storage
@@ -231,20 +326,128 @@ class MADDPG:
         Returns:
             Dict mapping agent_id -> action index
         """
-        return {
-            agent_id: self.agents[agent_id].select_action(
-                observations[agent_id],
-                prev_observations[agent_id] if prev_observations else None,
-                explore
-            )
-            for agent_id in self.agent_ids
-        }
+        actions = {}
+        for i, agent_id in enumerate(self.agent_ids):
+            obs = observations[agent_id]
+
+            if self.use_ai_net:
+                if prev_observations is not None:
+                    obs_t      = torch.tensor(obs, dtype=torch.float32).to(self.device)
+                    prev_obs_t = torch.tensor(
+                        prev_observations[agent_id], dtype=torch.float32
+                    ).to(self.device)
+                    sub_assign = self.sub_assignments[i].to(self.device)
+                    with torch.no_grad():
+                        a_hat = self.ai_net.forward(sub_assign, i, obs_t, prev_obs_t)
+                    actor_input = np.concatenate([obs, a_hat.cpu().numpy()])
+                else:
+                    # First step of episode: no previous obs, use zero vector
+                    agent_type_i = self.ai_net.agent_types[i]
+                    actor_input = np.concatenate(
+                        [obs, np.zeros(self.ai_net.total_action_dim_by_type[agent_type_i], dtype=np.float32)]
+                    )
+            elif self.use_prev_obs and prev_observations is not None:
+                actor_input = np.concatenate([prev_observations[agent_id], obs])
+            else:
+                actor_input = obs
+
+            actions[agent_id] = self.agents[agent_id].select_action(actor_input, explore)
+        return actions
 
     def store_transition(self, observations, actions, rewards, next_observations, dones,
                          prev_joint_action=None, prev_observations=None):
         """Store a transition for all agents."""
         self.buffer.add(observations, actions, rewards, next_observations, dones,
                         prev_joint_action, prev_observations)
+
+    def _update_ai_net_online(self, batch):
+        """
+        Update AINet on the current replay buffer batch (simultaneous training).
+
+        Uses the same transitions just sampled for the MADDPG update so that
+        AINet always tracks the current policy's behavior.
+
+        For each (observer, observed) pair:
+          curr_obs  = batch['next_obs'][observer]   (observation at t+1)
+          last_obs  = batch['obs'][observer]         (observation at t)
+          target    = batch['actions'][observed]     (one-hot action taken at t,
+                      which caused the obs_t -> next_obs_t transition)
+        """
+        for observer_ind, observer_id in enumerate(self.agent_ids):
+            observer_type = self.ai_net.agent_types[observer_ind]
+            sub_assign    = self.sub_assignments[observer_ind].to(self.device)
+
+            curr_obs_batch = batch['next_obs'][observer_id]
+            last_obs_batch = batch['obs'][observer_id]
+
+            slfgbl_mask = sub_assign == -1
+            curr_slfgbl = curr_obs_batch[:, slfgbl_mask]
+            last_slfgbl = last_obs_batch[:, slfgbl_mask]
+
+            for observed_ind, observed_id in enumerate(self.agent_ids):
+                observed_type = self.ai_net.agent_types[observed_ind]
+                target = batch['actions'][observed_id]  # (B, action_dim), already one-hot
+
+                if observed_ind == observer_ind:
+                    bundle = torch.cat([curr_slfgbl, last_slfgbl,
+                                        curr_slfgbl - last_slfgbl], dim=1)
+                    a_pred = self.ai_net.self_modules[observer_type](bundle)
+                    loss   = F.mse_loss(a_pred, target)
+                    self.ai_net.self_modules[observer_type].update(loss)
+                else:
+                    if observed_type == observer_type and self.ai_net.fellow_mode != 'action':
+                        # Fellow-same-type slots predict displacement, not action,
+                        # in velocity modes -- not supported for online updates.
+                        continue
+
+                    other_mask  = sub_assign == observed_ind
+                    curr_other  = curr_obs_batch[:, other_mask]
+                    last_other  = last_obs_batch[:, other_mask]
+                    curr_bundle = torch.cat([curr_other, curr_slfgbl], dim=1)
+                    last_bundle = torch.cat([last_other, last_slfgbl], dim=1)
+                    bundle      = torch.cat([curr_bundle, last_bundle,
+                                             curr_bundle - last_bundle], dim=1)
+                    a_pred = self.ai_net.social_modules[observer_type][observed_type](bundle)
+                    loss   = F.mse_loss(a_pred, target)
+                    self.ai_net.social_modules[observer_type][observed_type].update(loss)
+
+    def _compute_gates(self, batch):
+        """
+        Compute, for each agent, a trust gate in (0, 1] based on how far this
+        update's batch-mean action distribution has drifted from that agent's
+        own slow-moving EMA of past batch-mean actions.
+
+        Gate is 1.0 (no attenuation) on the very first call for each agent
+        (no drift reference yet) and whenever drift is zero. The EMA is
+        updated once per call, using the same drift measurement.
+        """
+        gates = {}
+        for aid in self.agent_ids:
+            batch_mean_action = batch['actions'][aid].mean(dim=0).detach()
+            ema = self.action_emas[aid]
+            if ema is None:
+                gates[aid] = 1.0
+            else:
+                drift = torch.norm(batch_mean_action - ema, p=2).item()
+                gates[aid] = float(np.exp(-drift / self.gating_temperature))
+            if ema is None:
+                self.action_emas[aid] = batch_mean_action.clone()
+            else:
+                self.action_emas[aid] = (
+                    (1 - self.gating_ema_decay) * ema
+                    + self.gating_ema_decay * batch_mean_action
+                )
+        return gates
+
+    def _gate_for(self, owner_id, other_id):
+        """Trust gate applied to other_id's obs/action features within owner_id's
+        critic input. 1.0 (no-op) unless adversary gating is on and other_id is
+        on the opposing team from owner_id."""
+        if not self.use_adversary_gating:
+            return 1.0
+        if other_id not in self._opponent_ids.get(owner_id, ()):
+            return 1.0
+        return self._current_gates.get(other_id, 1.0)
 
     def update(self, batch_size, gamma):
         """
@@ -256,55 +459,105 @@ class MADDPG:
         """
         batch = self.buffer.sample(batch_size)
 
+        if self.use_adversary_gating:
+            self._current_gates = self._compute_gates(batch)
+
+        # TD3-style delayed policy updates: actor and target-network updates only
+        # happen every `policy_delay` calls to update(); critics update every call.
+        if self.use_twin_critic:
+            self._update_step_count += 1
+            update_actor = (self._update_step_count % self.policy_delay == 0)
+        else:
+            update_actor = True
+        self._should_soft_update = update_actor
+
         # Compute target actions for all agents using target networks
-        # For prev_obs: at next_state, the "previous obs" is the current obs
+        # AI_Net: â^{j+1} = AI_Net(next_obs, curr_obs)  → actor sees [next_obs, â^{j+1}]
+        # prev_obs mode: actor sees [curr_obs (as prev), next_obs]
         target_actions = {}
-        for agent_id in self.agent_ids:
-            if self.use_prev_obs:
-                # Concatenate current obs (as prev) with next obs for target actor
-                target_actor_input = torch.cat([batch['obs'][agent_id], batch['next_obs'][agent_id]], dim=1)
+        for i, agent_id in enumerate(self.agent_ids):
+            if self.use_ai_net:
+                sub_assign = self.sub_assignments[i].to(self.device)
+                with torch.no_grad():
+                    a_hat_next = self.ai_net.forward_batch(
+                        sub_assign, i,
+                        batch['next_obs'][agent_id],
+                        batch['obs'][agent_id]   # current obs is "prev" for next step
+                    )
+                target_actor_input = torch.cat(
+                    [batch['next_obs'][agent_id], a_hat_next], dim=1
+                )
+            elif self.use_prev_obs:
+                target_actor_input = torch.cat(
+                    [batch['obs'][agent_id], batch['next_obs'][agent_id]], dim=1
+                )
             else:
                 target_actor_input = batch['next_obs'][agent_id]
             target_actions[agent_id] = self.agents[agent_id].get_target_action(target_actor_input)
 
         # Zero shared actor gradients before updates
-        if self.shared_actor:
+        if self.shared_actor and update_actor:
             self.shared_agent_actor_optimizer.zero_grad()
             if self.shared_adversary_actor_optimizer is not None:
                 self.shared_adversary_actor_optimizer.zero_grad()
 
         for agent_id in self.agent_ids:
-            self._update_agent(agent_id, batch, target_actions, gamma)
+            self._update_agent(agent_id, batch, target_actions, gamma, update_actor)
 
         # Step shared actor optimizers after all agent updates
-        if self.shared_actor:
+        if self.shared_actor and update_actor:
             torch.nn.utils.clip_grad_norm_(self.shared_agent_actor.parameters(), 0.5)
             self.shared_agent_actor_optimizer.step()
             if self.shared_adversary_actor_optimizer is not None:
                 torch.nn.utils.clip_grad_norm_(self.shared_adversary_actor.parameters(), 0.5)
                 self.shared_adversary_actor_optimizer.step()
 
-    def _update_agent(self, agent_id, batch, target_actions, gamma):
-        """Update a single agent's actor and critic."""
+        if self.online_ai_net:
+            self._update_ai_net_online(batch)
+
+    def _update_agent(self, agent_id, batch, target_actions, gamma, update_actor=True):
+        """Update a single agent's critic (every call) and actor (only when
+        update_actor is True — always True unless use_twin_critic delays it)."""
         agent = self.agents[agent_id]
 
         # === Critic Update ===
-        # Current Q-value: Q(s, a) where s and a are all agents' obs/actions
-        current_obs = torch.cat([batch['obs'][aid] for aid in self.agent_ids], dim=1)
-        current_actions = torch.cat([batch['actions'][aid] for aid in self.agent_ids], dim=1)
+        # Current Q-value: Q(s, a) where s and a are all agents' obs/actions.
+        # Adversary gating (if enabled): opponent agents' obs/action features are
+        # scaled by a per-opponent trust gate before concatenation; own-team
+        # features (including this agent's own) are always passed through
+        # unscaled (gate == 1.0).
+        current_obs = torch.cat(
+            [batch['obs'][aid] * self._gate_for(agent_id, aid) for aid in self.agent_ids], dim=1
+        )
+        current_actions = torch.cat(
+            [batch['actions'][aid] * self._gate_for(agent_id, aid) for aid in self.agent_ids], dim=1
+        )
 
         # Build critic input (optionally include previous joint action)
         if self.use_prev_action:
             prev_joint_action = batch['prev_joint_action']
+            if self.use_adversary_gating:
+                prev_joint_action = torch.cat([
+                    prev_joint_action[:, self._action_offsets[aid]:
+                                       self._action_offsets[aid] + self.action_dims[aid]]
+                    * self._gate_for(agent_id, aid)
+                    for aid in self.agent_ids
+                ], dim=1)
             critic_input = torch.cat([current_obs, prev_joint_action, current_actions], dim=1)
         else:
             critic_input = torch.cat([current_obs, current_actions], dim=1)
 
         current_q = agent.critic(critic_input).squeeze(1)
+        if self.use_twin_critic:
+            current_q2 = agent.critic2(critic_input).squeeze(1)
 
         # Target Q-value: r + gamma * Q'(s', a') * (1 - done)
-        next_obs = torch.cat([batch['next_obs'][aid] for aid in self.agent_ids], dim=1)
-        next_actions = torch.cat([target_actions[aid] for aid in self.agent_ids], dim=1)
+        next_obs = torch.cat(
+            [batch['next_obs'][aid] * self._gate_for(agent_id, aid) for aid in self.agent_ids], dim=1
+        )
+        next_actions = torch.cat(
+            [target_actions[aid] * self._gate_for(agent_id, aid) for aid in self.agent_ids], dim=1
+        )
 
         with torch.no_grad():
             # For target: prev_action at next state = current_actions
@@ -313,21 +566,51 @@ class MADDPG:
             else:
                 target_critic_input = torch.cat([next_obs, next_actions], dim=1)
 
-            target_q = agent.target_critic(target_critic_input).squeeze(1)
+            if self.use_twin_critic:
+                # Clipped double Q-learning (TD3): use the min of both target
+                # critics to counter Q-value overestimation bias.
+                target_q1 = agent.target_critic(target_critic_input).squeeze(1)
+                target_q2 = agent.target_critic2(target_critic_input).squeeze(1)
+                target_q = torch.min(target_q1, target_q2)
+            else:
+                target_q = agent.target_critic(target_critic_input).squeeze(1)
             td_target = batch['rewards'][agent_id] + gamma * target_q * (1 - batch['dones'][agent_id])
 
-        critic_loss = F.mse_loss(current_q, td_target)
+        if self.use_twin_critic:
+            critic_loss = F.mse_loss(current_q, td_target) + F.mse_loss(current_q2, td_target)
+            agent.critic_optimizer.zero_grad()
+            agent.critic2_optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(agent.critic2.parameters(), 0.5)
+            agent.critic_optimizer.step()
+            agent.critic2_optimizer.step()
+        else:
+            critic_loss = F.mse_loss(current_q, td_target)
+            agent.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), 0.5)
+            agent.critic_optimizer.step()
 
-        agent.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), 0.5)
-        agent.critic_optimizer.step()
+        if not update_actor:
+            return
 
         # === Actor Update ===
-        # Get fresh action from current agent's actor (with gradients)
-        # Other agents use their stored actions from the buffer (matches reference)
-        # Concatenate prev_obs with current obs if use_prev_obs is enabled
-        if self.use_prev_obs:
+        # Build actor input for current agent:
+        #   AI_Net mode:    [obs, â]  where â = AI_Net(obs, prev_obs)
+        #   prev_obs mode:  [prev_obs, obs]
+        #   standard:       obs
+        agent_idx = self.agent_ids.index(agent_id)
+        if self.use_ai_net:
+            sub_assign = self.sub_assignments[agent_idx].to(self.device)
+            with torch.no_grad():
+                a_hat = self.ai_net.forward_batch(
+                    sub_assign, agent_idx,
+                    batch['obs'][agent_id],
+                    batch['prev_obs'][agent_id]
+                )
+            actor_obs = torch.cat([batch['obs'][agent_id], a_hat], dim=1)
+        elif self.use_prev_obs:
             actor_obs = torch.cat([batch['prev_obs'][agent_id], batch['obs'][agent_id]], dim=1)
         else:
             actor_obs = batch['obs'][agent_id]
@@ -336,15 +619,16 @@ class MADDPG:
             actor_obs, explore=True, return_logits=True
         )
 
-        # Build action list: current agent uses fresh action, others use buffer actions
+        # Build action list: current agent uses fresh action, others use buffer
+        # actions (gated by opponent trust, same as the critic update above).
         actor_actions = []
         for aid in self.agent_ids:
             if aid == agent_id:
                 actor_actions.append(action)
             else:
-                actor_actions.append(batch['actions'][aid])
+                actor_actions.append(batch['actions'][aid] * self._gate_for(agent_id, aid))
 
-        # Actor loss: maximize Q-value
+        # Actor loss: maximize Q-value (critic 1 only, matching TD3 convention)
         all_actor_actions = torch.cat(actor_actions, dim=1)
 
         if self.use_prev_action:
@@ -369,7 +653,14 @@ class MADDPG:
             agent.actor_optimizer.step()
 
     def soft_update_targets(self, tau):
-        """Soft update all target networks."""
+        """Soft update all target networks.
+
+        With use_twin_critic, this is a no-op except on the same delayed
+        schedule as the actor update (matches TD3: targets only move when
+        the policy does)."""
+        if self.use_twin_critic and not self._should_soft_update:
+            return
+
         if self.shared_actor:
             # Update shared target actors once (not per-agent)
             self._soft_update(self.shared_agent_target_actor, self.shared_agent_actor, tau)
@@ -378,11 +669,15 @@ class MADDPG:
             # Update individual critics
             for agent in self.agents.values():
                 self._soft_update(agent.target_critic, agent.critic, tau)
+                if self.use_twin_critic:
+                    self._soft_update(agent.target_critic2, agent.critic2, tau)
         else:
             # Original behavior: update both actor and critic per agent
             for agent in self.agents.values():
                 self._soft_update(agent.target_actor, agent.actor, tau)
                 self._soft_update(agent.target_critic, agent.critic, tau)
+                if self.use_twin_critic:
+                    self._soft_update(agent.target_critic2, agent.critic2, tau)
 
     @staticmethod
     def _soft_update(target, source, tau):
@@ -404,11 +699,17 @@ class MADDPG:
                     for agent_id, agent in self.agents.items()
                 }
             }
+            if self.use_twin_critic:
+                state['critics2'] = {
+                    agent_id: agent.critic2.state_dict()
+                    for agent_id, agent in self.agents.items()
+                }
         else:
             state = {
                 agent_id: {
                     'actor': agent.actor.state_dict(),
-                    'critic': agent.critic.state_dict()
+                    'critic': agent.critic.state_dict(),
+                    **({'critic2': agent.critic2.state_dict()} if self.use_twin_critic else {})
                 }
                 for agent_id, agent in self.agents.items()
             }
@@ -435,6 +736,9 @@ class MADDPG:
             for agent_id, agent in self.agents.items():
                 agent.critic.load_state_dict(state['critics'][agent_id])
                 agent.target_critic = deepcopy(agent.critic)
+                if self.use_twin_critic and 'critics2' in state:
+                    agent.critic2.load_state_dict(state['critics2'][agent_id])
+                    agent.target_critic2 = deepcopy(agent.critic2)
         else:
             # Load individual actor/critic weights (original format)
             for agent_id, agent in self.agents.items():
@@ -442,3 +746,6 @@ class MADDPG:
                 agent.critic.load_state_dict(state[agent_id]['critic'])
                 agent.target_actor = deepcopy(agent.actor)
                 agent.target_critic = deepcopy(agent.critic)
+                if self.use_twin_critic and 'critic2' in state[agent_id]:
+                    agent.critic2.load_state_dict(state[agent_id]['critic2'])
+                    agent.target_critic2 = deepcopy(agent.critic2)

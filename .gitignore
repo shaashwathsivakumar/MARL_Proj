@@ -21,9 +21,14 @@ build/
 .env
 .venv/
 venv/
+myenv/
 
-# Results (optional - uncomment to ignore)
-# results/
+# External / nested repos
+maddpg-pettingzoo-pytorch/
+
+# Training logs
+*.log
+diagnostic_logs/
 
 # OS
 .DS_Store

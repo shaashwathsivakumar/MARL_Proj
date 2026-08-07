@@ -79,7 +79,8 @@ class MultiAgentReplayBuffer:
     Optionally stores previous joint actions for critic conditioning.
     """
     def __init__(self, agent_ids, capacity, obs_dims, action_dims, device='cpu',
-                 geometric_sampling=False, geo_alpha=1e-5, use_prev_action=False):
+                 geometric_sampling=False, geo_alpha=1e-5, use_prev_action=False,
+                 use_prev_obs=False):
         """
         Args:
             agent_ids: List of agent identifiers
@@ -90,10 +91,12 @@ class MultiAgentReplayBuffer:
             geometric_sampling: Whether to use geometric sampling
             geo_alpha: Decay rate for geometric sampling
             use_prev_action: Whether to store previous joint actions
+            use_prev_obs: Whether to store previous per-agent observations
         """
         self.agent_ids = agent_ids
         self.device = device
         self.use_prev_action = use_prev_action
+        self.use_prev_obs = use_prev_obs
         self.action_dims = action_dims
 
         self.buffers = {
@@ -104,15 +107,22 @@ class MultiAgentReplayBuffer:
             for agent_id in agent_ids
         }
 
-        # Storage for previous joint actions (concatenated across all agents)
-        if use_prev_action:
-            total_action_dim = sum(action_dims.values())
-            self.prev_joint_actions = np.zeros((capacity, total_action_dim), dtype=np.float32)
+        if use_prev_action or use_prev_obs:
             self._ptr = 0
             self._capacity = capacity
 
+        if use_prev_action:
+            total_action_dim = sum(action_dims.values())
+            self.prev_joint_actions = np.zeros((capacity, total_action_dim), dtype=np.float32)
+
+        if use_prev_obs:
+            self.prev_observations = {
+                agent_id: np.zeros((capacity, obs_dims[agent_id]), dtype=np.float32)
+                for agent_id in agent_ids
+            }
+
     def add(self, observations, actions, rewards, next_observations, dones,
-            prev_joint_action=None):
+            prev_joint_action=None, prev_observations=None):
         """
         Add transitions for all agents.
 
@@ -123,6 +133,7 @@ class MultiAgentReplayBuffer:
             next_observations: Dict of next observations per agent
             dones: Dict of done flags per agent
             prev_joint_action: Optional concatenated previous joint action
+            prev_observations: Optional dict mapping agent_id -> previous observation
         """
         for agent_id in self.agent_ids:
             action = actions[agent_id]
@@ -141,9 +152,14 @@ class MultiAgentReplayBuffer:
                 dones[agent_id]
             )
 
-        # Store previous joint action if enabled
         if self.use_prev_action and prev_joint_action is not None:
             self.prev_joint_actions[self._ptr] = prev_joint_action
+
+        if self.use_prev_obs and prev_observations is not None:
+            for agent_id in self.agent_ids:
+                self.prev_observations[agent_id][self._ptr] = prev_observations[agent_id]
+
+        if self.use_prev_action or self.use_prev_obs:
             self._ptr = (self._ptr + 1) % self._capacity
 
     def sample(self, batch_size):
@@ -174,11 +190,16 @@ class MultiAgentReplayBuffer:
             batch['next_obs'][agent_id] = next_obs
             batch['dones'][agent_id] = dones
 
-        # Include previous joint action if enabled
         if self.use_prev_action:
             batch['prev_joint_action'] = torch.from_numpy(
                 self.prev_joint_actions[indices]
             ).to(self.device)
+
+        if self.use_prev_obs:
+            batch['prev_obs'] = {
+                agent_id: torch.from_numpy(self.prev_observations[agent_id][indices]).to(self.device)
+                for agent_id in self.agent_ids
+            }
 
         return batch
 
